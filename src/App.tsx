@@ -54,23 +54,24 @@ async function syncToSheets(scriptUrl, lots) {
     lot.units.forEach(unit => {
       const payout = unit.actualSalePrice ? calcPayout(unit.actualSalePrice) : null;
       rows.push({
-        lotId: lot.id,
-        lotName: lot.name,
-        unitName: unit.name,
-        condition: lot.condition,
-        source: lot.source,
-        totalCostPaid: lot.totalCostPaid,
-        inboundShipping: lot.inboundShipping || 0,
-        quantity: lot.units.length,
-        costPerUnit: perUnit.toFixed(2),
-        breakEven: calcBreakEven(perUnit).toFixed(2),
-        goalSellPrice: unit.goalSellPrice || "",
-        status: unit.status,
-        actualSalePrice: unit.actualSalePrice || "",
-        payoutAfterFees: payout !== null ? payout.toFixed(2) : "",
-        profitVsCost: payout !== null ? (payout - perUnit).toFixed(2) : "",
-        notes: lot.notes || "",
-        syncedAt: new Date().toISOString(),
+        lotId:            lot.id,
+        unitId:           unit.id,
+        lotName:          lot.name,
+        unitName:         unit.name,
+        condition:        lot.condition,
+        source:           lot.source,
+        lotTotalCost:     lotCost.toFixed(2),
+        lotQty:           lot.units.length,
+        costPerUnit:      perUnit.toFixed(2),
+        shippingPerUnit:  ((parseFloat(lot.inboundShipping)||0)/lot.units.length).toFixed(2),
+        breakEven:        calcBreakEven(perUnit).toFixed(2),
+        goalSellPrice:    unit.goalSellPrice || "",
+        status:           unit.status,
+        actualSalePrice:  unit.actualSalePrice || "",
+        payoutAfterFees:  payout !== null ? payout.toFixed(2) : "",
+        profitVsCost:     payout !== null ? (payout - perUnit).toFixed(2) : "",
+        notes:            lot.notes || "",
+        syncedAt:         new Date().toISOString(),
       });
     });
   });
@@ -130,6 +131,52 @@ export default function App() {
       setSyncStatus("success");
       setTimeout(() => setSyncStatus(null), 2500);
     } catch {
+      setSyncStatus("error");
+      setTimeout(() => setSyncStatus(null), 3000);
+    }
+  }
+
+  async function pullFromSheets() {
+    if (!settings.scriptUrl) return;
+    setSyncStatus("syncing");
+    try {
+      const url = settings.scriptUrl.replace("/exec", "/exec") + "?action=read";
+      const res = await fetch(url, { method: "GET", mode: "cors" });
+      const data = await res.json();
+      if (!data.rows || data.rows.length === 0) { setSyncStatus("success"); setTimeout(()=>setSyncStatus(null),2000); return; }
+
+      // Rebuild lots from flat sheet rows
+      const lotMap = {};
+      data.rows.forEach(row => {
+        const lotId = row["Lot Name"] + "_" + row["Source"];
+        if (!lotMap[lotId]) {
+          lotMap[lotId] = {
+            id: Date.now() + Math.random(),
+            name: row["Lot Name"],
+            condition: row["Condition"],
+            source: row["Source"],
+            totalCostPaid: row["Lot Total Cost"] || "",
+            inboundShipping: "",
+            quantity: "1",
+            goalSellPrice: "",
+            notes: row["Notes"] || "",
+            units: [],
+          };
+        }
+        lotMap[lotId].units.push({
+          id: Date.now() + Math.random(),
+          name: row["Unit Name"] || row["Lot Name"],
+          status: row["Status"] || "In Stock",
+          goalSellPrice: row["Goal Price"] ? String(row["Goal Price"]) : "",
+          actualSalePrice: row["Sold For"] ? String(row["Sold For"]) : "",
+        });
+      });
+
+      setLots(Object.values(lotMap));
+      setSettings(s => ({ ...s, lastSynced: Date.now() }));
+      setSyncStatus("success");
+      setTimeout(() => setSyncStatus(null), 2500);
+    } catch(err) {
       setSyncStatus("error");
       setTimeout(() => setSyncStatus(null), 3000);
     }
@@ -217,18 +264,26 @@ export default function App() {
           <span style={{ fontSize:11, color:syncBadgeColor, fontWeight:600, background:`${syncBadgeColor}18`, padding:"3px 10px", borderRadius:8 }}>
             {syncBadgeText}
           </span>
-          {settings.syncMode === "manual" && settings.scriptUrl && (
+          {settings.syncMode === "manual" && settings.scriptUrl && (<>
             <button onClick={doSync} disabled={syncStatus==="syncing"}
               style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#a78bfa", fontWeight:600, cursor:"pointer" }}>
-              Sync now
+              ↑ Push
             </button>
-          )}
-          {settings.syncMode === "export" && settings.scriptUrl && (
+            <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
+              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#60a5fa", fontWeight:600, cursor:"pointer" }}>
+              ↓ Pull
+            </button>
+          </>)}
+          {settings.syncMode === "export" && settings.scriptUrl && (<>
             <button onClick={doSync} disabled={syncStatus==="syncing"}
               style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#a78bfa", fontWeight:600, cursor:"pointer" }}>
-              Export to Sheets
+              ↑ Export
             </button>
-          )}
+            <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
+              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#60a5fa", fontWeight:600, cursor:"pointer" }}>
+              ↓ Import
+            </button>
+          </>)}
           <button onClick={() => setView("settings")}
             style={{ fontSize:16, background:"none", border:"none", cursor:"pointer", color:"#4b5563", padding:"0 4px" }}>⚙️</button>
         </div>
@@ -266,45 +321,133 @@ export default function App() {
               <div style={{ marginBottom:14 }}>
                 <div style={{ fontSize:11, color:"#6b7280", fontWeight:700, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Apps Script Code (copy this):</div>
                 <div style={{ background:"#0d0b1e", border:"1px solid rgba(255,255,255,0.1)", borderRadius:10, padding:"10px 12px", fontSize:11, color:"#a78bfa", fontFamily:"monospace", lineHeight:1.6, overflowX:"auto", whiteSpace:"pre" }}>
-{`function doPost(e) {
+{`// ── PASTE THIS ENTIRE SCRIPT INTO APPS SCRIPT ──
+
+function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
-    if (data.action !== "sync") return ok();
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName("Inventory") 
-      || ss.insertSheet("Inventory");
-    sheet.clearContents();
-    var headers = [
-      "Lot Name","Unit Name","Condition",
-      "Source","Total Cost","Shipping",
-      "Qty","Cost/Unit","Break Even",
-      "Goal Price","Status","Sold For",
-      "Payout","Profit","Notes","Synced"
-    ];
-    sheet.appendRow(headers);
-    data.rows.forEach(function(r) {
-      sheet.appendRow([
-        r.lotName, r.unitName, r.condition,
-        r.source, r.totalCostPaid, r.inboundShipping,
-        r.quantity, r.costPerUnit, r.breakEven,
-        r.goalSellPrice, r.status, r.actualSalePrice,
-        r.payoutAfterFees, r.profitVsCost,
-        r.notes, r.syncedAt
-      ]);
-    });
-    return ok();
+    var ss   = SpreadsheetApp.getActiveSpreadsheet();
+    if (data.action === "sync") {
+      writeInventory(ss, data.rows);
+    }
+    return ok({status:"ok"});
   } catch(err) {
-    return ok();
+    return ok({status:"error", msg: err.toString()});
   }
 }
-function ok() {
+
+function doGet(e) {
+  // Two-way: app reads changes made directly in the sheet
+  try {
+    var ss    = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName("Inventory");
+    if (!sheet) return ok({rows:[]});
+    var data  = sheet.getDataRange().getValues();
+    var headers = data[0];
+    var rows = data.slice(1).map(function(row) {
+      var obj = {};
+      headers.forEach(function(h, i) { obj[h] = row[i]; });
+      return obj;
+    });
+    return ok({rows: rows});
+  } catch(err) {
+    return ok({rows:[], error: err.toString()});
+  }
+}
+
+function writeInventory(ss, rows) {
+  var sheet = ss.getSheetByName("Inventory")
+    || ss.insertSheet("Inventory");
+  sheet.clearContents();
+  sheet.clearFormats();
+
+  var headers = [
+    "Lot Name","Unit Name","Condition","Source",
+    "Lot Total Cost","Shipping/Unit","Cost/Unit",
+    "Break Even","Goal Price","Status",
+    "Sold For","Payout","Profit","Notes","Synced At"
+  ];
+  sheet.appendRow(headers);
+
+  rows.forEach(function(r) {
+    sheet.appendRow([
+      r.lotName, r.unitName, r.condition, r.source,
+      Number(r.lotTotalCost), Number(r.shippingPerUnit),
+      Number(r.costPerUnit), Number(r.breakEven),
+      r.goalSellPrice ? Number(r.goalSellPrice) : "",
+      r.status,
+      r.actualSalePrice ? Number(r.actualSalePrice) : "",
+      r.payoutAfterFees ? Number(r.payoutAfterFees) : "",
+      r.profitVsCost ? Number(r.profitVsCost) : "",
+      r.notes, r.syncedAt
+    ]);
+  });
+
+  // ── STYLING ──
+  var lastRow = sheet.getLastRow();
+  var lastCol = headers.length;
+  var fullRange = sheet.getRange(1, 1, lastRow, lastCol);
+
+  // Font & borders
+  fullRange.setFontFamily("Arial");
+  fullRange.setFontSize(10);
+  fullRange.setBorder(true,true,true,true,true,true,"#e0e0e0",SpreadsheetApp.BorderStyle.SOLID);
+
+  // Header row styling
+  var headerRange = sheet.getRange(1, 1, 1, lastCol);
+  headerRange.setBackground("#4a235a");
+  headerRange.setFontColor("#ffffff");
+  headerRange.setFontWeight("bold");
+  headerRange.setFontSize(11);
+
+  // Alternate row colors
+  for (var i = 2; i <= lastRow; i++) {
+    var rowRange = sheet.getRange(i, 1, 1, lastCol);
+    rowRange.setBackground(i % 2 === 0 ? "#f8f0ff" : "#ffffff");
+    rowRange.setFontColor("#222222");
+  }
+
+  // Status column color coding (col 10)
+  for (var j = 2; j <= lastRow; j++) {
+    var statusCell = sheet.getRange(j, 10);
+    var val = statusCell.getValue();
+    if (val === "Sold")     { statusCell.setBackground("#d4edda"); statusCell.setFontColor("#155724"); statusCell.setFontWeight("bold"); }
+    if (val === "Listed")   { statusCell.setBackground("#fff3cd"); statusCell.setFontColor("#856404"); statusCell.setFontWeight("bold"); }
+    if (val === "In Stock") { statusCell.setBackground("#cce5ff"); statusCell.setFontColor("#004085"); statusCell.setFontWeight("bold"); }
+  }
+
+  // Profit column — green/red (col 13)
+  for (var k = 2; k <= lastRow; k++) {
+    var profitCell = sheet.getRange(k, 13);
+    var pval = profitCell.getValue();
+    if (pval !== "") {
+      profitCell.setFontColor(pval >= 0 ? "#155724" : "#721c24");
+      profitCell.setFontWeight("bold");
+    }
+  }
+
+  // Currency format for number columns
+  var currencyCols = [5,6,7,8,9,11,12,13];
+  currencyCols.forEach(function(col) {
+    if (lastRow > 1) {
+      sheet.getRange(2, col, lastRow-1, 1)
+        .setNumberFormat("\"$\"#,##0.00");
+    }
+  });
+
+  // Auto-resize all columns
+  for (var c = 1; c <= lastCol; c++) {
+    sheet.autoResizeColumn(c);
+  }
+
+  // Freeze header row
+  sheet.setFrozenRows(1);
+}
+
+function ok(obj) {
   return ContentService
-    .createTextOutput(
-      JSON.stringify({status:"ok"})
-    )
-    .setMimeType(
-      ContentService.MimeType.JSON
-    );
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
 }`}
                 </div>
               </div>
@@ -332,10 +475,16 @@ function ok() {
               </Field>
 
               {settings.scriptUrl && (
-                <button onClick={doSync} disabled={syncStatus==="syncing"}
-                  style={{ width:"100%", padding:"12px 0", borderRadius:12, border:"none", background:"linear-gradient(135deg,#7c3aed,#a855f7)", color:"#fff", fontWeight:700, fontSize:14, cursor:"pointer", marginTop:4 }}>
-                  {syncStatus==="syncing" ? "⏳ Syncing..." : "Test Sync Now"}
-                </button>
+                <div style={{ display:"flex", gap:8, marginTop:4 }}>
+                  <button onClick={doSync} disabled={syncStatus==="syncing"}
+                    style={{ flex:1, padding:"12px 0", borderRadius:12, border:"none", background:"linear-gradient(135deg,#7c3aed,#a855f7)", color:"#fff", fontWeight:700, fontSize:14, cursor:"pointer" }}>
+                    {syncStatus==="syncing" ? "⏳..." : "↑ Push to Sheets"}
+                  </button>
+                  <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
+                    style={{ flex:1, padding:"12px 0", borderRadius:12, border:"1.5px solid #60a5fa", background:"rgba(96,165,250,0.1)", color:"#60a5fa", fontWeight:700, fontSize:14, cursor:"pointer" }}>
+                    {syncStatus==="syncing" ? "⏳..." : "↓ Pull from Sheets"}
+                  </button>
+                </div>
               )}
               {settings.lastSynced && (
                 <div style={{ textAlign:"center", fontSize:11, color:"#4b5563", marginTop:8 }}>Last synced: {fmtDate(settings.lastSynced)}</div>
