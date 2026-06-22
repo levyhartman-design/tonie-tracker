@@ -3,28 +3,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const COMMISSION = 0.08;
 const PROC_PCT = 0.029;
 const PROC_FLAT = 0.30;
-const STORAGE_KEY = "dahlia_tonie_tracker_v5";
-const OLD_KEYS = ["dahlia_tonie_tracker_v4", "dahlia_tonie_tracker_v3", "dahlia_tonie_tracker_v2"];
-const SETTINGS_KEY = "dahlia_tonie_settings_v5";
+const STORAGE_KEY = "dahlia_tonie_tracker_v7";
+const OLD_KEYS = ["dahlia_tonie_tracker_v6", "dahlia_tonie_tracker_v5", "dahlia_tonie_tracker_v4", "dahlia_tonie_tracker_v3", "dahlia_tonie_tracker_v2"];
+const SETTINGS_KEY = "dahlia_tonie_settings_v7";
 const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdRd2MShDnHkGfHQxIbpp7Hbn6Zn-FDDEatNDNNOq6w8kmXECMNzJlXezB/exec";
 
 const CONDITIONS = ["New (sealed)", "Like New", "Good", "Fair"];
 const STATUSES = ["In Stock", "Listed", "Sold"];
 const STATUS_COLORS: Record<string, string> = { "In Stock": "#60a5fa", Listed: "#f59e0b", Sold: "#22c55e" };
 
-type Unit = { id: string; name: string; status: string; goalSellPrice: string; actualSalePrice: string; notes: string };
-type Lot = { id: string; name: string; condition: string; source: string; productTotal: string; shippingTotal: string; goalSellPrice: string; notes: string; units: Unit[] };
+type Unit = { id: string; name: string; category: string; status: string; goalSellPrice: string; actualSalePrice: string; notes: string; dateAdded: string; soldAt: string };
+type Lot = { id: string; name: string; condition: string; source: string; seller: string; productTotal: string; shippingTotal: string; goalSellPrice: string; notes: string; units: Unit[] };
 type Settings = { syncMode: "manual" | "auto"; lastSynced: number | null };
 
 type FlatUnit = { lot: Lot; unit: Unit; unitIndex: number; productUnit: number; shippingUnit: number; totalUnit: number; breakEven: number; payout: number | null; profit: number | null };
 
-const EMPTY_FORM = { name: "", condition: "New (sealed)", source: "", productTotal: "", shippingTotal: "", quantity: "1", goalSellPrice: "", notes: "" };
+const EMPTY_FORM = { name: "", condition: "New (sealed)", source: "", seller: "", category: "", productTotal: "", shippingTotal: "", quantity: "1", goalSellPrice: "", notes: "" };
 
 function uid() { return `${Date.now()}_${Math.random().toString(36).slice(2)}`; }
 function num(v: any) { const n = parseFloat(String(v ?? "").replace(/[$,]/g, "")); return Number.isFinite(n) ? n : 0; }
 function money(n: number | null | undefined) { if (n === null || n === undefined || !Number.isFinite(n)) return "—"; return n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`; }
 function pct(n: number | null | undefined) { if (n === null || n === undefined || !Number.isFinite(n)) return "—"; return `${n.toFixed(0)}%`; }
 function dateText(ts: number | null) { if (!ts) return "Never"; return new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
+function isoNow() { return new Date().toISOString(); }
+function displayDate(v: any) { if (!v) return "—"; const d = new Date(v); return isNaN(d.getTime()) ? "—" : d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" }); }
+function dateMs(v: any) { const d = new Date(v || 0); return isNaN(d.getTime()) ? 0 : d.getTime(); }
 function payoutFromSale(sale: any) { const sp = num(sale); if (!sp) return null; return sp - sp * COMMISSION - (sp * PROC_PCT + PROC_FLAT); }
 function breakEven(cost: number) { return (cost + PROC_FLAT) / (1 - COMMISSION - PROC_PCT); }
 function lotProduct(lot: Lot) { return num(lot.productTotal); }
@@ -35,19 +38,22 @@ function shipUnit(lot: Lot) { return lotShipping(lot) / lotQty(lot); }
 function costUnit(lot: Lot) { return productUnit(lot) + shipUnit(lot); }
 function lotTotal(lot: Lot) { return lotProduct(lot) + lotShipping(lot); }
 
-function makeUnits(qty: number, goal: string, lotName: string): Unit[] {
+function makeUnits(qty: number, goal: string, lotName: string, category = ""): Unit[] {
   return Array.from({ length: Math.max(1, qty) }, (_, i) => ({
     id: uid(),
     name: Math.max(1, qty) > 1 ? `${lotName} #${i + 1}` : lotName,
+    category,
     status: "In Stock",
     goalSellPrice: goal || "",
     actualSalePrice: "",
-    notes: ""
+    notes: "",
+    dateAdded: isoNow(),
+    soldAt: ""
   }));
 }
 
 function normalizeLot(raw: any): Lot {
-  const rawUnits = Array.isArray(raw.units) && raw.units.length ? raw.units : makeUnits(parseInt(raw.quantity || raw.unitsInLot || "1") || 1, String(raw.goalSellPrice || ""), raw.name || raw.lotName || "Tonie");
+  const rawUnits = Array.isArray(raw.units) && raw.units.length ? raw.units : makeUnits(parseInt(raw.quantity || raw.unitsInLot || "1") || 1, String(raw.goalSellPrice || ""), raw.name || raw.lotName || "Tonie", String(raw.category ?? raw["Category"] ?? ""));
   const product = raw.productTotal ?? raw.totalCostPaid ?? raw.lotProductCost ?? raw["Product Cost Total"] ?? raw["Lot Product Total"] ?? "";
   const shipping = raw.shippingTotal ?? raw.inboundShipping ?? raw.lotShipping ?? raw["Shipping Total"] ?? raw["Lot Shipping Total"] ?? "";
   return {
@@ -55,6 +61,7 @@ function normalizeLot(raw: any): Lot {
     name: String(raw.name ?? raw.lotName ?? raw["Lot Name"] ?? "Untitled Lot"),
     condition: String(raw.condition ?? raw["Condition"] ?? "New (sealed)"),
     source: String(raw.source ?? raw["Source"] ?? ""),
+    seller: String(raw.seller ?? raw["Seller"] ?? ""),
     productTotal: String(product ?? ""),
     shippingTotal: String(shipping ?? ""),
     goalSellPrice: String(raw.goalSellPrice ?? raw["Goal Price"] ?? ""),
@@ -62,10 +69,13 @@ function normalizeLot(raw: any): Lot {
     units: rawUnits.map((u: any) => ({
       id: String(u.id ?? u.unitId ?? uid()),
       name: String(u.name ?? u.unitName ?? u["Unit Name"] ?? raw.name ?? "Tonie"),
+      category: String(u.category ?? u["Category"] ?? raw.category ?? ""),
       status: STATUSES.includes(String(u.status ?? u["Status"])) ? String(u.status ?? u["Status"]) : "In Stock",
       goalSellPrice: String(u.goalSellPrice ?? u["Goal Price"] ?? raw.goalSellPrice ?? ""),
       actualSalePrice: String(u.actualSalePrice ?? u["Sold For"] ?? ""),
-      notes: String(u.notes ?? "")
+      notes: String(u.notes ?? ""),
+      dateAdded: String(u.dateAdded ?? u["Date Added"] ?? raw.dateAdded ?? isoNow()),
+      soldAt: String(u.soldAt ?? u["Sold At"] ?? "")
     }))
   };
 }
@@ -93,8 +103,10 @@ function flattenRows(lots: Lot[]) {
         unitId: unit.id,
         lotName: lot.name,
         unitName: unit.name,
+        category: unit.category || "",
         condition: lot.condition,
         source: lot.source,
+        seller: lot.seller || "",
         unitsInLot: qty,
         lotProductTotal: index === 0 ? lotProduct(lot).toFixed(2) : "",
         lotShippingTotal: index === 0 ? lotShipping(lot).toFixed(2) : "",
@@ -109,6 +121,8 @@ function flattenRows(lots: Lot[]) {
         payoutAfterFees: payout !== null ? payout.toFixed(2) : "",
         profitVsCost: payout !== null ? (payout - cu).toFixed(2) : "",
         notes: index === 0 ? lot.notes || unit.notes || "" : unit.notes || "",
+        dateAdded: unit.dateAdded || new Date().toISOString(),
+        soldAt: unit.soldAt || "",
         syncedAt: new Date().toISOString()
       });
     });
@@ -155,7 +169,9 @@ function rebuildLotsFromRows(rows: any[]): Lot[] {
     const lotName = String(row["Lot Name"] || row.lotName || "Untitled Lot").trim();
     const condition = String(row["Condition"] || row.condition || "New (sealed)").trim();
     const source = String(row["Source"] || row.source || "").trim();
-    const key = lotId || `${lotName}|${condition}|${source}`;
+    const seller = String(row["Seller"] || row.seller || "").trim();
+    const category = String(row["Category"] || row.category || "").trim();
+    const key = lotId || `${lotName}|${condition}|${source}|${seller}`;
 
     const rawProduct = row["Lot Product Total"] ?? row["Product Cost Total"] ?? row.lotProductTotal ?? row.lotProductCost;
     const rawShipping = row["Lot Shipping Total"] ?? row["Shipping Total"] ?? row.lotShippingTotal ?? row.lotShipping;
@@ -175,6 +191,7 @@ function rebuildLotsFromRows(rows: any[]): Lot[] {
         name: lotName,
         condition,
         source,
+        seller,
         productTotal: totals.product ? String(totals.product) : "",
         shippingTotal: totals.shipping ? String(totals.shipping) : "",
         goalSellPrice: "",
@@ -190,10 +207,13 @@ function rebuildLotsFromRows(rows: any[]): Lot[] {
     map[key].units.push({
       id: String(row["Unit ID"] || row.unitId || `${key}_${idx}`),
       name: String(row["Unit Name"] || row.unitName || lotName),
+      category: category,
       status: STATUSES.includes(String(row["Status"] || row.status)) ? String(row["Status"] || row.status) : "In Stock",
       goalSellPrice: String(row["Goal Price"] ?? row.goalSellPrice ?? ""),
       actualSalePrice: String(row["Sold For"] ?? row.actualSalePrice ?? ""),
-      notes: ""
+      notes: "",
+      dateAdded: String(row["Date Added"] || row.dateAdded || isoNow()),
+      soldAt: String(row["Sold At"] || row.soldAt || "")
     });
   });
 
@@ -237,23 +257,23 @@ function writeInventory(ss, rows) {
   sheet.clearFormats();
 
   var headers = [
-    'Lot ID','Unit ID','Lot Name','Unit Name','Condition','Source','Units In Lot',
+    'Lot ID','Unit ID','Lot Name','Unit Name','Category','Condition','Source','Seller','Units In Lot',
     'Lot Product Total','Lot Shipping Total','Lot Total Cost',
     'Product Cost / Unit','Shipping / Unit','Total Cost / Unit','Break Even',
-    'Goal Price','Status','Sold For','Payout','Profit','Notes','Synced At'
+    'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Added','Sold At','Synced At'
   ];
   sheet.appendRow(headers);
 
   rows.forEach(function(r) {
     sheet.appendRow([
-      r.lotId || '', r.unitId || '', r.lotName || '', r.unitName || '', r.condition || '', r.source || '', Number(r.unitsInLot || 1),
+      r.lotId || '', r.unitId || '', r.lotName || '', r.unitName || '', r.category || '', r.condition || '', r.source || '', r.seller || '', Number(r.unitsInLot || 1),
       r.lotProductTotal === '' ? '' : Number(r.lotProductTotal || 0),
       r.lotShippingTotal === '' ? '' : Number(r.lotShippingTotal || 0),
       r.lotTotalCost === '' ? '' : Number(r.lotTotalCost || 0),
       Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.totalCostPerUnit || r.costPerUnit || 0), Number(r.breakEven || 0),
       r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'In Stock',
       r.actualSalePrice ? Number(r.actualSalePrice) : '', r.payoutAfterFees ? Number(r.payoutAfterFees) : '', r.profitVsCost ? Number(r.profitVsCost) : '',
-      r.notes || '', r.syncedAt || new Date().toISOString()
+      r.notes || '', r.dateAdded || '', r.soldAt || '', r.syncedAt || new Date().toISOString()
     ]);
   });
 
@@ -265,17 +285,17 @@ function writeInventory(ss, rows) {
 
   for (var i = 2; i <= lastRow; i++) {
     sheet.getRange(i, 1, 1, lastCol).setBackground(i % 2 === 0 ? '#f8f0ff' : '#ffffff').setFontColor('#222222');
-    var statusCell = sheet.getRange(i, 16);
+    var statusCell = sheet.getRange(i, 18);
     var val = statusCell.getValue();
     if (val === 'Sold') statusCell.setBackground('#d4edda').setFontColor('#155724').setFontWeight('bold');
     if (val === 'Listed') statusCell.setBackground('#fff3cd').setFontColor('#856404').setFontWeight('bold');
     if (val === 'In Stock') statusCell.setBackground('#cce5ff').setFontColor('#004085').setFontWeight('bold');
-    var profitCell = sheet.getRange(i, 19);
+    var profitCell = sheet.getRange(i, 21);
     var p = profitCell.getValue();
     if (p !== '') profitCell.setFontColor(Number(p) >= 0 ? '#155724' : '#721c24').setFontWeight('bold');
   }
 
-  [8,9,10,11,12,13,14,15,17,18,19].forEach(function(col) {
+  [10,11,12,13,14,15,16,17,19,20,21].forEach(function(col) {
     if (lastRow > 1) sheet.getRange(2, col, lastRow - 1, 1).setNumberFormat('"$"#,##0.00');
   });
   for (var c = 1; c <= lastCol; c++) sheet.autoResizeColumn(c);
@@ -300,6 +320,12 @@ export default function App() {
   const [form, setForm] = useState<any>(EMPTY_FORM);
   const [editLotId, setEditLotId] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState("All");
+  const [filterCategory, setFilterCategory] = useState("All");
+  const [filterCondition, setFilterCondition] = useState("All");
+  const [filterSource, setFilterSource] = useState("All");
+  const [filterSeller, setFilterSeller] = useState("All");
+  const [sortBy, setSortBy] = useState("date-desc");
+  const [dashRange, setDashRange] = useState("all");
   const [search, setSearch] = useState("");
   const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "success" | "error">("idle");
   const [message, setMessage] = useState("");
@@ -325,28 +351,51 @@ export default function App() {
     return { lot, unit, unitIndex, productUnit: productUnit(lot), shippingUnit: shipUnit(lot), totalUnit, breakEven: breakEven(totalUnit), payout, profit: payout !== null ? payout - totalUnit : null };
   })), [lots]);
 
+  const categories = useMemo(() => Array.from(new Set(allUnits.map(x => x.unit.category).filter(Boolean))).sort(), [allUnits]);
+  const sources = useMemo(() => Array.from(new Set(lots.map(l => l.source).filter(Boolean))).sort(), [lots]);
+  const sellers = useMemo(() => Array.from(new Set(lots.map(l => l.seller).filter(Boolean))).sort(), [lots]);
+  const conditions = useMemo(() => Array.from(new Set(lots.map(l => l.condition).filter(Boolean))).sort(), [lots]);
+
   const filteredUnits = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return allUnits.filter(x => {
+    const list = allUnits.filter(x => {
       const statusOk = filterStatus === "All" || x.unit.status === filterStatus;
-      const qOk = !q || `${x.unit.name} ${x.lot.name} ${x.lot.source} ${x.lot.condition} ${x.unit.status}`.toLowerCase().includes(q);
-      return statusOk && qOk;
+      const categoryOk = filterCategory === "All" || (x.unit.category || "") === filterCategory;
+      const conditionOk = filterCondition === "All" || x.lot.condition === filterCondition;
+      const sourceOk = filterSource === "All" || x.lot.source === filterSource;
+      const sellerOk = filterSeller === "All" || x.lot.seller === filterSeller;
+      const qOk = !q || `${x.unit.name} ${x.unit.category} ${x.lot.name} ${x.lot.source} ${x.lot.seller} ${x.lot.condition} ${x.unit.status}`.toLowerCase().includes(q);
+      return statusOk && categoryOk && conditionOk && sourceOk && sellerOk && qOk;
     });
-  }, [allUnits, filterStatus, search]);
+    return [...list].sort((a, b) => {
+      if (sortBy === "name") return a.unit.name.localeCompare(b.unit.name);
+      if (sortBy === "category") return (a.unit.category || "").localeCompare(b.unit.category || "") || a.unit.name.localeCompare(b.unit.name);
+      if (sortBy === "seller") return (a.lot.seller || "").localeCompare(b.lot.seller || "") || a.unit.name.localeCompare(b.unit.name);
+      if (sortBy === "date-asc") return dateMs(a.unit.dateAdded) - dateMs(b.unit.dateAdded);
+      return dateMs(b.unit.dateAdded) - dateMs(a.unit.dateAdded);
+    });
+  }, [allUnits, filterStatus, filterCategory, filterCondition, filterSource, filterSeller, sortBy, search]);
 
   const stats = useMemo(() => {
+    const now = Date.now();
+    const since = dashRange === "week" ? now - 7 * 86400000 : dashRange === "month" ? now - 30 * 86400000 : dashRange === "year" ? now - 365 * 86400000 : 0;
     const totalInvested = lots.reduce((s, l) => s + lotTotal(l), 0);
     const sold = allUnits.filter(x => x.unit.status === "Sold");
     const listed = allUnits.filter(x => x.unit.status === "Listed");
     const stock = allUnits.filter(x => x.unit.status === "In Stock");
-    const realizedProfit = sold.reduce((s, x) => s + (x.profit ?? -x.totalUnit), 0);
+    const soldInRange = sold.filter(x => !since || dateMs(x.unit.soldAt || x.unit.dateAdded) >= since);
+    const actualSales = soldInRange.reduce((s, x) => s + num(x.unit.actualSalePrice), 0);
+    const actualPayout = soldInRange.reduce((s, x) => s + (x.payout || 0), 0);
+    const realizedProfit = soldInRange.reduce((s, x) => s + (x.profit ?? -x.totalUnit), 0);
+    const projectedSales = allUnits.filter(x => x.unit.status !== "Sold").reduce((s, x) => s + num(x.unit.goalSellPrice), 0);
     const potentialProfit = allUnits.filter(x => x.unit.status !== "Sold").reduce((s, x) => {
       const projectedPayout = payoutFromSale(x.unit.goalSellPrice);
       return s + (projectedPayout !== null ? projectedPayout - x.totalUnit : 0);
     }, 0);
     const avgCost = allUnits.length ? allUnits.reduce((s, x) => s + x.totalUnit, 0) / allUnits.length : 0;
-    return { totalInvested, realizedProfit, potentialProfit, avgCost, totalUnits: allUnits.length, sold: sold.length, listed: listed.length, stock: stock.length, lots: lots.length };
-  }, [lots, allUnits]);
+    const avgGoal = allUnits.length ? allUnits.reduce((s, x) => s + num(x.unit.goalSellPrice), 0) / allUnits.length : 0;
+    return { totalInvested, realizedProfit, potentialProfit, projectedSales, actualSales, actualPayout, avgCost, avgGoal, totalUnits: allUnits.length, sold: sold.length, listed: listed.length, stock: stock.length, lots: lots.length, rangeSold: soldInRange.length };
+  }, [lots, allUnits, dashRange]);
 
   function flash(text: string) { setMessage(text); setTimeout(() => setMessage(""), 3000); }
 
@@ -384,21 +433,28 @@ export default function App() {
       setLots(prev => prev.map(l => {
         if (l.id !== editLotId) return l;
         let units = [...l.units];
-        if (qty > units.length) for (let i = units.length; i < qty; i++) units.push({ id: uid(), name: `${form.name} #${i + 1}`, status: "In Stock", goalSellPrice: form.goalSellPrice || "", actualSalePrice: "", notes: "" });
+        if (qty > units.length) for (let i = units.length; i < qty; i++) units.push({ id: uid(), name: `${form.name} #${i + 1}`, category: form.category || "", status: "In Stock", goalSellPrice: form.goalSellPrice || "", actualSalePrice: "", notes: "", dateAdded: isoNow(), soldAt: "" });
         if (qty < units.length) units = units.slice(0, qty);
-        units = units.map((u, i) => ({ ...u, name: u.name || (qty > 1 ? `${form.name} #${i + 1}` : form.name), goalSellPrice: u.goalSellPrice || form.goalSellPrice || "" }));
+        units = units.map((u, i) => ({ ...u, name: u.name || (qty > 1 ? `${form.name} #${i + 1}` : form.name), category: u.category || form.category || "", goalSellPrice: u.goalSellPrice || form.goalSellPrice || "", dateAdded: u.dateAdded || isoNow(), soldAt: u.soldAt || "" }));
         return normalizeLot({ ...l, ...form, units });
       }));
       setEditLotId(null);
     } else {
-      setLots(prev => [...prev, normalizeLot({ ...form, id: uid(), units: makeUnits(qty, form.goalSellPrice, form.name) })]);
+      setLots(prev => [...prev, normalizeLot({ ...form, id: uid(), units: makeUnits(qty, form.goalSellPrice, form.name, form.category || "") })]);
     }
     setForm(EMPTY_FORM);
     setView("inventory");
   }
 
   function updateUnit(lotId: string, unitId: string, changes: Partial<Unit>) {
-    setLots(prev => prev.map(l => l.id !== lotId ? l : { ...l, units: l.units.map(u => u.id !== unitId ? u : { ...u, ...changes }) }));
+    setLots(prev => prev.map(l => l.id !== lotId ? l : { ...l, units: l.units.map(u => {
+      if (u.id !== unitId) return u;
+      const next = { ...u, ...changes };
+      if ((changes.status === "Sold" || (changes.actualSalePrice !== undefined && changes.actualSalePrice !== "")) && !next.soldAt) next.soldAt = isoNow();
+      if (changes.status && changes.status !== "Sold" && !next.actualSalePrice) next.soldAt = "";
+      if (!next.dateAdded) next.dateAdded = isoNow();
+      return next;
+    }) }));
   }
   function updateLot(lotId: string, changes: Partial<Lot>) {
     setLots(prev => prev.map(l => l.id !== lotId ? l : { ...l, ...changes }));
@@ -408,7 +464,7 @@ export default function App() {
   }
   function deleteLot(lotId: string) { if (confirm("Delete this whole lot?")) setLots(prev => prev.filter(l => l.id !== lotId)); }
   function editLot(lot: Lot) {
-    setForm({ name: lot.name, condition: lot.condition, source: lot.source, productTotal: lot.productTotal, shippingTotal: lot.shippingTotal, quantity: String(lot.units.length), goalSellPrice: lot.goalSellPrice || "", notes: lot.notes || "" });
+    setForm({ name: lot.name, condition: lot.condition, source: lot.source, seller: lot.seller || "", category: lot.units[0]?.category || "", productTotal: lot.productTotal, shippingTotal: lot.shippingTotal, quantity: String(lot.units.length), goalSellPrice: lot.goalSellPrice || "", notes: lot.notes || "" });
     setEditLotId(lot.id);
     setView("add");
   }
@@ -440,8 +496,8 @@ export default function App() {
     </header>
 
     <main className="container">
-      {view === "dashboard" && <Dashboard stats={stats} lots={lots} allUnits={allUnits} goInventory={goInventory} editLot={editLot} setView={setView} />}
-      {view === "inventory" && <Inventory filteredUnits={filteredUnits} filterStatus={filterStatus} setFilterStatus={setFilterStatus} search={search} setSearch={setSearch} updateUnit={updateUnit} updateLot={updateLot} deleteUnit={deleteUnit} editLot={editLot} />}
+      {view === "dashboard" && <Dashboard stats={stats} lots={lots} allUnits={allUnits} goInventory={goInventory} editLot={editLot} setView={setView} dashRange={dashRange} setDashRange={setDashRange} />}
+      {view === "inventory" && <Inventory filteredUnits={filteredUnits} filterStatus={filterStatus} setFilterStatus={setFilterStatus} filterCategory={filterCategory} setFilterCategory={setFilterCategory} filterCondition={filterCondition} setFilterCondition={setFilterCondition} filterSource={filterSource} setFilterSource={setFilterSource} filterSeller={filterSeller} setFilterSeller={setFilterSeller} categories={categories} sources={sources} sellers={sellers} conditions={conditions} sortBy={sortBy} setSortBy={setSortBy} search={search} setSearch={setSearch} updateUnit={updateUnit} updateLot={updateLot} deleteUnit={deleteUnit} editLot={editLot} />}
       {view === "add" && <AddForm form={form} setForm={setForm} saveLot={saveLot} editLotId={editLotId} setEditLotId={setEditLotId} setView={setView} formQty={formQty} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} expectedProfit={expectedProfit} expectedRoi={expectedRoi} />}
       {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} pullFromSheets={pullFromSheets} setLots={setLots} setView={setView} />}
     </main>
@@ -455,60 +511,65 @@ export default function App() {
   </div>;
 }
 
-function Dashboard({ stats, lots, allUnits, goInventory, editLot, setView }: any) {
-  const recentSold = allUnits.filter((x: FlatUnit) => x.unit.status === "Sold").slice(0, 5);
+function Dashboard({ stats, lots, allUnits, goInventory, editLot, setView, dashRange, setDashRange }: any) {
+  const recentSold = allUnits.filter((x: FlatUnit) => x.unit.status === "Sold").sort((a: FlatUnit,b: FlatUnit)=>dateMs(b.unit.soldAt)-dateMs(a.unit.soldAt)).slice(0, 5);
   const needsListing = allUnits.filter((x: FlatUnit) => x.unit.status === "In Stock").slice(0, 6);
   return <>
-    <div className="statsGrid">
-      <button className="statCard" onClick={() => goInventory("All")}><span>Total invested</span><b className="gold">{money(stats.totalInvested)}</b></button>
+    <div className="rangeBar"><span>Dashboard range:</span>{[["all","All time"],["week","Last week"],["month","Last month"],["year","Last year"]].map(([v,l]) => <button key={v} onClick={() => setDashRange(v)} className={dashRange === v ? "pill active" : "pill"}>{l}</button>)}</div>
+    <div className="statsGrid wide">
+      <button className="statCard" onClick={() => goInventory("All")}><span>Total invested</span><b className="gold">{money(stats.totalInvested)}</b><em>{stats.totalUnits} units · {stats.lots} lots</em></button>
+      <button className="statCard" onClick={() => goInventory("Sold")}><span>Actual sales</span><b className="green">{money(stats.actualSales)}</b><em>{stats.rangeSold} sold in range · payout {money(stats.actualPayout)}</em></button>
+      <button className="statCard" onClick={() => goInventory("Sold")}><span>Actual profit</span><b className={stats.realizedProfit >= 0 ? "green" : "red"}>{money(stats.realizedProfit)}</b><em>After estimated fees</em></button>
+      <button className="statCard" onClick={() => goInventory("Listed")}><span>Future projected sales</span><b className="blue">{money(stats.projectedSales)}</b><em>Projected profit {money(stats.potentialProfit)}</em></button>
       <button className="statCard" onClick={() => goInventory("In Stock")}><span>In stock</span><b className="blue">{stats.stock}</b><em>{stats.listed} listed · {stats.sold} sold</em></button>
-      <button className="statCard" onClick={() => goInventory("Sold")}><span>Profit in pocket</span><b className={stats.realizedProfit >= 0 ? "green" : "red"}>{money(stats.realizedProfit)}</b></button>
-      <button className="statCard" onClick={() => goInventory("Listed")}><span>Potential profit</span><b className="blue">{money(stats.potentialProfit)}</b><em>Avg cost {money(stats.avgCost)}</em></button>
+      <button className="statCard" onClick={() => goInventory("All")}><span>Averages</span><b>{money(stats.avgCost)}</b><em>Avg goal {money(stats.avgGoal)}</em></button>
     </div>
 
     {lots.length === 0 ? <div className="empty"><div>📦</div><p>No Tonies yet — add your first purchase.</p><button className="primary" onClick={() => setView("add")}>+ Add Tonie</button></div> : <>
       <div className="dashGrid">
-        <section className="panel"><h3>Lots Summary</h3>{lots.map((lot: Lot) => <div className="lotSummary" key={lot.id}><div><b>{lot.name}</b><small>{lot.units.length} units · {lot.condition} · {lot.source || "No source"}</small></div><div><strong>{money(lotTotal(lot))}</strong><small>{money(costUnit(lot))}/unit</small></div><button onClick={() => editLot(lot)}>Edit</button></div>)}</section>
-        <section className="panel"><h3>Needs Listing</h3>{needsListing.length ? needsListing.map((x: FlatUnit) => <div className="miniLine" key={x.unit.id}><span>{x.unit.name}</span><b>{money(x.unit.goalSellPrice ? num(x.unit.goalSellPrice) : 0)}</b></div>) : <p className="muted">Nothing waiting in stock.</p>}</section>
-        <section className="panel"><h3>Recent Sold</h3>{recentSold.length ? recentSold.map((x: FlatUnit) => <div className="miniLine" key={x.unit.id}><span>{x.unit.name}</span><b className={x.profit && x.profit >= 0 ? "green" : "red"}>{money(x.profit)}</b></div>) : <p className="muted">No sold units yet.</p>}</section>
+        <section className="panel"><h3>Lots Summary</h3>{lots.map((lot: Lot) => <div className="lotSummary" key={lot.id}><div><b>{lot.name}</b><small>{lot.units.length} units · {lot.condition} · {lot.source || "No source"}{lot.seller ? ` · ${lot.seller}` : ""}</small></div><div><strong>{money(lotTotal(lot))}</strong><small>{money(costUnit(lot))}/unit</small></div><button onClick={() => editLot(lot)}>Edit</button></div>)}</section>
+        <section className="panel"><h3>Needs Listing</h3>{needsListing.length ? needsListing.map((x: FlatUnit) => <div className="miniLine" key={x.unit.id}><span>{x.unit.name}<small>{x.unit.category || "No category"}</small></span><b>{money(x.unit.goalSellPrice ? num(x.unit.goalSellPrice) : 0)}</b></div>) : <p className="muted">Nothing waiting in stock.</p>}</section>
+        <section className="panel"><h3>Recent Sold</h3>{recentSold.length ? recentSold.map((x: FlatUnit) => <div className="miniLine" key={x.unit.id}><span>{x.unit.name}<small>{displayDate(x.unit.soldAt)}</small></span><b className={x.profit && x.profit >= 0 ? "green" : "red"}>{money(x.profit)}</b></div>) : <p className="muted">No sold units yet.</p>}</section>
       </div>
     </>}
   </>;
 }
 
-function Inventory({ filteredUnits, filterStatus, setFilterStatus, search, setSearch, updateUnit, updateLot, deleteUnit, editLot }: any) {
+function Inventory({ filteredUnits, filterStatus, setFilterStatus, filterCategory, setFilterCategory, filterCondition, setFilterCondition, filterSource, setFilterSource, filterSeller, setFilterSeller, categories, sources, sellers, conditions, sortBy, setSortBy, search, setSearch, updateUnit, updateLot, deleteUnit, editLot }: any) {
   return <>
-    <div className="toolbar">
-      <input className="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search unit, lot, source…" />
-      <div className="pills">{["All", "In Stock", "Listed", "Sold"].map(s => <button key={s} onClick={() => setFilterStatus(s)} className={filterStatus === s ? "pill active" : "pill"}>{s}</button>)}</div>
+    <div className="toolbar advanced">
+      <input className="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search unit, lot, category, source, seller…" />
+      <select value={sortBy} onChange={e => setSortBy(e.target.value)}><option value="date-desc">Newest first</option><option value="date-asc">Oldest first</option><option value="name">Name A-Z</option><option value="category">Category A-Z</option><option value="seller">Seller A-Z</option></select>
+      <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>{["All", "In Stock", "Listed", "Sold"].map(s => <option key={s}>{s}</option>)}</select>
+      <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)}><option>All</option>{categories.map((c: string) => <option key={c}>{c}</option>)}</select>
+      <select value={filterCondition} onChange={e => setFilterCondition(e.target.value)}><option>All</option>{conditions.map((c: string) => <option key={c}>{c}</option>)}</select>
+      <select value={filterSource} onChange={e => setFilterSource(e.target.value)}><option>All</option>{sources.map((c: string) => <option key={c}>{c}</option>)}</select>
+      <select value={filterSeller} onChange={e => setFilterSeller(e.target.value)}><option>All</option>{sellers.map((c: string) => <option key={c}>{c}</option>)}</select>
+      <button className="secondary noMargin" onClick={() => { setFilterStatus("All"); setFilterCategory("All"); setFilterCondition("All"); setFilterSource("All"); setFilterSeller("All"); setSearch(""); }}>Clear</button>
     </div>
 
     <div className="sheetWrap">
       <table className="inventoryTable">
-        <thead><tr><th>Unit Name</th><th>Lot</th><th>Condition</th><th>Source</th><th>Status</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal $</th><th>Sold $</th><th>Payout</th><th>Profit</th><th>Notes</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Date Added</th><th>Unit Name</th><th>Category</th><th>Lot</th><th>Condition</th><th>Source</th><th>Seller</th><th>Status</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal $</th><th>Sold $</th><th>Sold Date</th><th>Payout</th><th>Profit</th><th>Notes</th><th>Actions</th></tr></thead>
         <tbody>{filteredUnits.map((x: FlatUnit) => <tr key={x.unit.id}>
+          <td>{displayDate(x.unit.dateAdded)}</td>
           <td><input value={x.unit.name} onChange={e => updateUnit(x.lot.id, x.unit.id, { name: e.target.value })} /></td>
+          <td><input value={x.unit.category} onChange={e => updateUnit(x.lot.id, x.unit.id, { category: e.target.value })} placeholder="Category" /></td>
           <td><button className="lotLink" onClick={() => editLot(x.lot)}>{x.lot.name}</button></td>
           <td>{x.lot.condition}</td>
           <td><input value={x.lot.source} onChange={e => updateLot(x.lot.id, { source: e.target.value })} /></td>
+          <td><input value={x.lot.seller || ""} onChange={e => updateLot(x.lot.id, { seller: e.target.value })} /></td>
           <td><select value={x.unit.status} onChange={e => updateUnit(x.lot.id, x.unit.id, { status: e.target.value })}>{STATUSES.map(s => <option key={s}>{s}</option>)}</select></td>
           <td>{money(x.productUnit)}</td><td>{money(x.shippingUnit)}</td><td>{money(x.totalUnit)}</td><td>{money(x.breakEven)}</td>
           <td><input value={x.unit.goalSellPrice} onChange={e => updateUnit(x.lot.id, x.unit.id, { goalSellPrice: e.target.value })} inputMode="decimal" /></td>
           <td><input value={x.unit.actualSalePrice} onChange={e => updateUnit(x.lot.id, x.unit.id, { actualSalePrice: e.target.value, status: e.target.value ? "Sold" : x.unit.status })} inputMode="decimal" /></td>
+          <td>{displayDate(x.unit.soldAt)}</td>
           <td>{x.payout === null ? "—" : money(x.payout)}</td><td className={x.profit !== null && x.profit >= 0 ? "profitGood" : "profitBad"}>{x.profit === null ? "—" : money(x.profit)}</td>
           <td><input value={x.unit.notes} onChange={e => updateUnit(x.lot.id, x.unit.id, { notes: e.target.value })} /></td>
           <td><button className="dangerSmall" onClick={() => deleteUnit(x.lot.id, x.unit.id)}>Delete</button></td>
         </tr>)}</tbody>
       </table>
     </div>
-
-    <div className="mobileCards">{filteredUnits.map((x: FlatUnit) => <div className="unitCard" key={x.unit.id}>
-      <div className="cardTop"><div><b>{x.unit.name}</b><small>Lot: {x.lot.name}</small></div><span style={{ color: STATUS_COLORS[x.unit.status] }}>{x.unit.status}</span></div>
-      <div className="miniGrid"><Mini label="Product/Unit" value={money(x.productUnit)} /><Mini label="Ship/Unit" value={money(x.shippingUnit)} /><Mini label="Cost/Unit" value={money(x.totalUnit)} /><Mini label="Break Even" value={money(x.breakEven)} /></div>
-      <div className="cardInputs"><Field label="Status"><select value={x.unit.status} onChange={e => updateUnit(x.lot.id, x.unit.id, { status: e.target.value })}>{STATUSES.map(s => <option key={s}>{s}</option>)}</select></Field><Field label="Goal $"><input value={x.unit.goalSellPrice} onChange={e => updateUnit(x.lot.id, x.unit.id, { goalSellPrice: e.target.value })} /></Field><Field label="Sold $"><input value={x.unit.actualSalePrice} onChange={e => updateUnit(x.lot.id, x.unit.id, { actualSalePrice: e.target.value, status: e.target.value ? "Sold" : x.unit.status })} /></Field></div>
-      {x.profit !== null && <div className={x.profit >= 0 ? "result good" : "result bad"}>Profit: {money(x.profit)}</div>}
-      <div className="cardActions"><button onClick={() => editLot(x.lot)}>Edit Lot</button><button className="dangerSmall" onClick={() => deleteUnit(x.lot.id, x.unit.id)}>Delete Unit</button></div>
-    </div>)}</div>
   </>;
 }
 
@@ -516,7 +577,7 @@ function AddForm({ form, setForm, saveLot, editLotId, setEditLotId, setView, for
   return <div className="formWrap">
     <h2>{editLotId ? "Edit Purchase Lot" : "Add Purchase Lot"}</h2>
     <Field label="Lot / Purchase Name"><input value={form.name} onChange={e => setForm((f: any) => ({ ...f, name: e.target.value }))} placeholder="e.g. eBay Tonies Lot" /></Field>
-    <div className="twoCols"><Field label="Condition"><select value={form.condition} onChange={e => setForm((f: any) => ({ ...f, condition: e.target.value }))}>{CONDITIONS.map(c => <option key={c}>{c}</option>)}</select></Field><Field label="Source"><input value={form.source} onChange={e => setForm((f: any) => ({ ...f, source: e.target.value }))} placeholder="eBay, Whatnot, Woot, etc." /></Field></div>
+    <div className="twoCols"><Field label="Condition"><select value={form.condition} onChange={e => setForm((f: any) => ({ ...f, condition: e.target.value }))}>{CONDITIONS.map(c => <option key={c}>{c}</option>)}</select></Field><Field label="Source"><input value={form.source} onChange={e => setForm((f: any) => ({ ...f, source: e.target.value }))} placeholder="eBay, Whatnot, Woot, etc." /></Field></div><div className="twoCols"><Field label="Seller"><input value={form.seller} onChange={e => setForm((f: any) => ({ ...f, seller: e.target.value }))} placeholder="Seller name, store, or account" /></Field><Field label="Category"><input value={form.category} onChange={e => setForm((f: any) => ({ ...f, category: e.target.value }))} placeholder="Leave blank or type Tonies, princess, Disney, etc." /></Field></div>
     <div className="twoCols"><Field label="Product Cost Total"><input value={form.productTotal} onChange={e => setForm((f: any) => ({ ...f, productTotal: e.target.value }))} inputMode="decimal" placeholder="150" /></Field><Field label="Shipping Total"><input value={form.shippingTotal} onChange={e => setForm((f: any) => ({ ...f, shippingTotal: e.target.value }))} inputMode="decimal" placeholder="25" /></Field></div>
     <div className="twoCols"><Field label="How Many Units"><input value={form.quantity} onChange={e => setForm((f: any) => ({ ...f, quantity: e.target.value }))} inputMode="numeric" /></Field><Field label="Goal Sell Price / Unit"><input value={form.goalSellPrice} onChange={e => setForm((f: any) => ({ ...f, goalSellPrice: e.target.value }))} inputMode="decimal" placeholder="45" /></Field></div>
     <div className="calcBox"><div className="miniGrid"><Mini label="Product / Unit" value={money(formProductUnit)} /><Mini label="Shipping / Unit" value={money(formShipUnit)} /><Mini label="Total / Unit" value={money(formUnitCost)} /><Mini label="Break Even" value={formBreakEven ? money(formBreakEven) : "—"} /><Mini label="Expected Profit" value={money(expectedProfit)} /><Mini label="Expected ROI" value={pct(expectedRoi)} /></div><p className="muted">Example: product total ÷ units + shipping total ÷ units. For $150 product + $25 shipping ÷ 13 units = $13.46 per unit.</p></div>
@@ -542,5 +603,5 @@ function Mini({ label, value }: { label: string; value: any }) { return <div cla
 function Field({ label, children }: any) { return <label className="field"><span>{label}</span>{children}</label>; }
 
 const css = `
-*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}.smallBtn,.gear,button{cursor:pointer}.gear{background:none;border:0;font-size:18px}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1360px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.blue{color:#60a5fa}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.lotSummary,.miniLine{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.lotSummary small{display:block;color:#9ca3af}.lotSummary button,.cardActions button,.lotLink,.linkBtn{background:none;border:0;color:#c4b5fd;font-weight:850}.empty{text-align:center;padding:38px}.empty div{font-size:48px}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.search{min-width:320px}.pills{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:1320px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:80px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.mobileCards{display:none}.formWrap{max-width:900px;margin:0 auto}.formWrap h2{margin:0 0 16px}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:270px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.sheetWrap{display:none}.mobileCards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.toolbar{align-items:stretch;flex-direction:column}.search{min-width:0}.cardTop{display:flex;justify-content:space-between;gap:10px}.cardTop small{display:block;color:#9ca3af}.cardInputs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.result{margin-top:10px;border-radius:10px;padding:9px;background:rgba(255,255,255,.05);font-weight:900}.result.good{color:#22c55e}.result.bad{color:#ef4444}.cardActions{display:flex;gap:10px;margin-top:10px}}@media(max-width:640px){.statsGrid,.twoCols,.miniGrid,.mobileCards,.cardInputs{grid-template-columns:1fr}.container{width:min(100% - 22px,1360px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.lotSummary{grid-template-columns:1fr auto}.lotSummary button{grid-column:1/-1;text-align:left}}
+*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}.smallBtn,.gear,button{cursor:pointer}.gear{background:none;border:0;font-size:18px}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1360px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statsGrid.wide{grid-template-columns:repeat(3,minmax(0,1fr))}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.blue{color:#60a5fa}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.lotSummary,.miniLine{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.lotSummary small{display:block;color:#9ca3af}.lotSummary button,.cardActions button,.lotLink,.linkBtn{background:none;border:0;color:#c4b5fd;font-weight:850}.empty{text-align:center;padding:38px}.empty div{font-size:48px}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar.advanced{display:grid;grid-template-columns:minmax(220px,1.7fr) repeat(5,minmax(130px,1fr)) auto}.rangeBar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px;color:#c4b5fd;font-size:12px;font-weight:900}.noMargin{margin:0}.search{min-width:320px}.pills{display:flex;gap:8px;flex-wrap:wrap}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:1580px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:80px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.mobileCards{display:none}.formWrap{max-width:900px;margin:0 auto}.formWrap h2{margin:0 0 16px}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:270px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid,.statsGrid.wide{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.toolbar{align-items:stretch;flex-direction:column}.toolbar.advanced{display:grid;grid-template-columns:1fr 1fr}.search{min-width:0}.cardTop{display:flex;justify-content:space-between;gap:10px}.cardTop small{display:block;color:#9ca3af}.cardInputs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}.result{margin-top:10px;border-radius:10px;padding:9px;background:rgba(255,255,255,.05);font-weight:900}.result.good{color:#22c55e}.result.bad{color:#ef4444}.cardActions{display:flex;gap:10px;margin-top:10px}}@media(max-width:640px){.statsGrid,.twoCols,.miniGrid,.mobileCards,.cardInputs{grid-template-columns:1fr}.container{width:min(100% - 22px,1360px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.lotSummary{grid-template-columns:1fr auto}.lotSummary button{grid-column:1/-1;text-align:left}}
 `;
