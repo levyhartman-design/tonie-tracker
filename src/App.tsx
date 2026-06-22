@@ -1,842 +1,416 @@
-import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-// ── WHATNOT FEE CONSTANTS ──
 const COMMISSION = 0.08;
-const PROC_PCT   = 0.029;
-const PROC_FLAT  = 0.30;
+const PROC_PCT = 0.029;
+const PROC_FLAT = 0.30;
+const STORAGE_KEY = "dahlia_tonie_tracker_v3";
+const OLD_STORAGE_KEY = "dahlia_tonie_tracker_v2";
+const SETTINGS_KEY = "dahlia_tonie_settings_v4";
+const OLD_SETTINGS_KEY = "dahlia_tonie_settings_v3";
+const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdRd2MShDnHkGfHQxIbpp7Hbn6Zn-FDDEatNDNNOq6w8kmXECMNzJlXezB/exec";
 
-function calcPayout(salePrice) {
-  const sp = parseFloat(salePrice) || 0;
-  return sp - sp * COMMISSION - (sp * PROC_PCT + PROC_FLAT);
-}
-function calcBreakEven(costToRecover) {
-  return (costToRecover + PROC_FLAT) / (1 - COMMISSION - PROC_PCT);
-}
-function fmt(n) {
-  if (n === null || n === undefined || isNaN(n)) return "—";
-  return n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`;
-}
-function fmtDate(ts) {
-  if (!ts) return "Never";
-  return new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-}
+const CONDITIONS = ["New (sealed)", "Like New", "Good", "Fair"];
+const SOURCES = ["eBay", "Facebook Marketplace", "Garage Sale", "Retail", "Lot", "Other"];
+const STATUSES = ["In Stock", "Listed", "Sold"];
+const statusColor: Record<string, string> = { "In Stock": "#60a5fa", Listed: "#f59e0b", Sold: "#22c55e" };
 
-const CONDITIONS  = ["New (sealed)", "Like New", "Good", "Fair"];
-const SOURCES     = ["eBay", "Facebook Marketplace", "Garage Sale", "Retail", "Lot", "Other"];
-const statusColor = { "In Stock": "#60a5fa", "Listed": "#f59e0b", "Sold": "#22c55e" };
-const STORAGE_KEY = "dahlia_tonie_tracker_v2";
-const SETTINGS_KEY = "dahlia_tonie_settings_v2";
+type Unit = { id: string | number; name: string; status: string; goalSellPrice?: string; actualSalePrice?: string; notes?: string };
+type Lot = { id: string | number; name: string; condition: string; source: string; totalCostPaid: string; inboundShipping: string; quantity?: string; goalSellPrice?: string; notes?: string; units: Unit[] };
+type Settings = { scriptUrl: string; syncMode: string; lastSynced: number | null };
 
-const EMPTY_FORM = {
-  name: "", condition: "New (sealed)", source: "eBay",
-  totalCostPaid: "", inboundShipping: "", quantity: "1",
-  goalSellPrice: "", notes: "",
-};
+const EMPTY_FORM = { name: "", condition: "New (sealed)", source: "eBay", totalCostPaid: "", inboundShipping: "", quantity: "1", goalSellPrice: "", notes: "" };
 
-function makeUnits(qty, goalSellPrice, baseName) {
-  return Array.from({ length: qty }, (_, i) => ({
-    id: Date.now() + i,
-    name: qty > 1 ? `${baseName} #${i + 1}` : baseName,
-    status: "In Stock",
-    goalSellPrice: goalSellPrice || "",
-    actualSalePrice: "",
+function num(v: any) { const n = parseFloat(String(v ?? "").replace(/[$,]/g, "")); return Number.isFinite(n) ? n : 0; }
+function money(n: number | null | undefined) { if (n === null || n === undefined || !Number.isFinite(n)) return "—"; return n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`; }
+function dateText(ts: number | null) { if (!ts) return "Never"; return new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
+function calcPayout(salePrice: any) { const sp = num(salePrice); return sp - sp * COMMISSION - (sp * PROC_PCT + PROC_FLAT); }
+function calcBreakEven(totalCostToRecover: number) { return (totalCostToRecover + PROC_FLAT) / (1 - COMMISSION - PROC_PCT); }
+function uid() { return `${Date.now()}_${Math.random().toString(36).slice(2)}`; }
+function lotProductCost(lot: Lot) { return num(lot.totalCostPaid); }
+function lotShipping(lot: Lot) { return num(lot.inboundShipping); }
+function lotQty(lot: Lot) { return Math.max(1, lot.units?.length || num(lot.quantity) || 1); }
+function productCostPerUnit(lot: Lot) { return lotProductCost(lot) / lotQty(lot); }
+function shippingPerUnit(lot: Lot) { return lotShipping(lot) / lotQty(lot); }
+function totalCostPerUnit(lot: Lot) { return productCostPerUnit(lot) + shippingPerUnit(lot); }
+function lotTotal(lot: Lot) { return lotProductCost(lot) + lotShipping(lot); }
+
+function makeUnits(qty: number, goalSellPrice: string, baseName: string): Unit[] {
+  return Array.from({ length: Math.max(1, qty) }, (_, i) => ({
+    id: uid(), name: qty > 1 ? `${baseName} #${i + 1}` : baseName, status: "In Stock", goalSellPrice: goalSellPrice || "", actualSalePrice: "", notes: ""
   }));
 }
 
-// ── GOOGLE SHEETS SYNC ──
-async function syncToSheets(scriptUrl, lots) {
-  if (!scriptUrl) throw new Error("No Script URL set");
-  // Flatten lots into rows
-  const rows = [];
-  lots.forEach(lot => {
-    const lotCost = (parseFloat(lot.totalCostPaid) || 0) + (parseFloat(lot.inboundShipping) || 0);
-    const perUnit = lotCost / lot.units.length;
-    lot.units.forEach(unit => {
-      const payout = unit.actualSalePrice ? calcPayout(unit.actualSalePrice) : null;
-      rows.push({
-        lotId:            lot.id,
-        unitId:           unit.id,
-        lotName:          lot.name,
-        unitName:         unit.name,
-        condition:        lot.condition,
-        source:           lot.source,
-        lotTotalCost:     lotCost.toFixed(2),
-        lotQty:           lot.units.length,
-        costPerUnit:      perUnit.toFixed(2),
-        shippingPerUnit:  ((parseFloat(lot.inboundShipping)||0)/lot.units.length).toFixed(2),
-        breakEven:        calcBreakEven(perUnit).toFixed(2),
-        goalSellPrice:    unit.goalSellPrice || "",
-        status:           unit.status,
-        actualSalePrice:  unit.actualSalePrice || "",
-        payoutAfterFees:  payout !== null ? payout.toFixed(2) : "",
-        profitVsCost:     payout !== null ? (payout - perUnit).toFixed(2) : "",
-        notes:            lot.notes || "",
-        syncedAt:         new Date().toISOString(),
-      });
-    });
-  });
-  const response = await fetch(scriptUrl, {
-    method: "POST",
-    mode: "no-cors",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "sync", rows }),
-  });
-  return true; // no-cors means we can't read response, assume success
+function normalizeLot(raw: any): Lot {
+  const units = Array.isArray(raw.units) && raw.units.length ? raw.units : makeUnits(parseInt(raw.quantity || "1") || 1, raw.goalSellPrice || "", raw.name || "Tonie");
+  return { id: raw.id ?? uid(), name: raw.name || "Untitled Lot", condition: raw.condition || "New (sealed)", source: raw.source || "Other", totalCostPaid: String(raw.totalCostPaid ?? ""), inboundShipping: String(raw.inboundShipping ?? ""), quantity: String(units.length), goalSellPrice: String(raw.goalSellPrice ?? ""), notes: raw.notes || "", units: units.map((u: any) => ({ id: u.id ?? uid(), name: u.name || raw.name || "Tonie", status: STATUSES.includes(u.status) ? u.status : "In Stock", goalSellPrice: String(u.goalSellPrice ?? raw.goalSellPrice ?? ""), actualSalePrice: String(u.actualSalePrice ?? ""), notes: u.notes || "" })) };
 }
 
-// ── MAIN APP ──
-export default function App() {
-  const [lots, setLots] = useState(() => {
-    try { const s = localStorage.getItem(STORAGE_KEY); return s ? JSON.parse(s) : []; } catch { return []; }
-  });
-  const [settings, setSettings] = useState(() => {
-    try { const s = localStorage.getItem(SETTINGS_KEY); return s ? JSON.parse(s) : { scriptUrl: "", syncMode: "manual", lastSynced: null }; } catch { return { scriptUrl: "", syncMode: "manual", lastSynced: null }; }
-  });
-
-  const [view, setView]             = useState("dashboard");
-  const [form, setForm]             = useState(EMPTY_FORM);
-  const [editLotId, setEditLotId]   = useState(null);
-  const [detailLotId, setDetailLotId] = useState(null);
-  const [filterStatus, setFilterStatus] = useState("All");
-  const [savedFlash, setSavedFlash] = useState(false);
-  const [syncStatus, setSyncStatus] = useState(null); // null | "syncing" | "success" | "error"
-  const autoSyncTimer = useRef(null);
-
-  // ── PERSIST LOTS ──
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(lots));
-      if (lots.length > 0) { setSavedFlash(true); setTimeout(() => setSavedFlash(false), 1500); }
-    } catch {}
-
-    // Auto sync trigger
-    if (settings.syncMode === "auto" && settings.scriptUrl && lots.length > 0) {
-      clearTimeout(autoSyncTimer.current);
-      autoSyncTimer.current = setTimeout(() => doSync(), 3000); // debounce 3s
-    }
-  }, [lots]);
-
-  // ── PERSIST SETTINGS ──
-  useEffect(() => {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
-  }, [settings]);
-
-  async function doSync() {
-    if (!settings.scriptUrl) { setSyncStatus("error"); setTimeout(() => setSyncStatus(null), 3000); return; }
-    setSyncStatus("syncing");
-    try {
-      await syncToSheets(settings.scriptUrl, lots);
-      const now = Date.now();
-      setSettings(s => ({ ...s, lastSynced: now }));
-      setSyncStatus("success");
-      setTimeout(() => setSyncStatus(null), 2500);
-    } catch {
-      setSyncStatus("error");
-      setTimeout(() => setSyncStatus(null), 3000);
-    }
-  }
-
-  async function pullFromSheets() {
-    if (!settings.scriptUrl) return;
-    setSyncStatus("syncing");
-    try {
-      const url = settings.scriptUrl.replace("/exec", "/exec") + "?action=read";
-      const res = await fetch(url, { method: "GET", mode: "cors" });
-      const data = await res.json();
-      if (!data.rows || data.rows.length === 0) { setSyncStatus("success"); setTimeout(()=>setSyncStatus(null),2000); return; }
-
-      // Rebuild lots from flat sheet rows
-      const lotMap = {};
-      data.rows.forEach(row => {
-        const lotId = row["Lot Name"] + "_" + row["Source"];
-        if (!lotMap[lotId]) {
-          lotMap[lotId] = {
-            id: Date.now() + Math.random(),
-            name: row["Lot Name"],
-            condition: row["Condition"],
-            source: row["Source"],
-            totalCostPaid: row["Lot Total Cost"] || "",
-            inboundShipping: "",
-            quantity: "1",
-            goalSellPrice: "",
-            notes: row["Notes"] || "",
-            units: [],
-          };
-        }
-        lotMap[lotId].units.push({
-          id: Date.now() + Math.random(),
-          name: row["Unit Name"] || row["Lot Name"],
-          status: row["Status"] || "In Stock",
-          goalSellPrice: row["Goal Price"] ? String(row["Goal Price"]) : "",
-          actualSalePrice: row["Sold For"] ? String(row["Sold For"]) : "",
-        });
-      });
-
-      setLots(Object.values(lotMap));
-      setSettings(s => ({ ...s, lastSynced: Date.now() }));
-      setSyncStatus("success");
-      setTimeout(() => setSyncStatus(null), 2500);
-    } catch(err) {
-      setSyncStatus("error");
-      setTimeout(() => setSyncStatus(null), 3000);
-    }
-  }
-
-  // ── STATS ──
-  const stats = useMemo(() => {
-    let totalInvested = 0, realizedProfit = 0, projectedProfit = 0, soldUnits = 0, inStockUnits = 0;
-    lots.forEach(lot => {
-      const lotCost = (parseFloat(lot.totalCostPaid)||0) + (parseFloat(lot.inboundShipping)||0);
-      totalInvested += lotCost;
-      const perUnit = lotCost / lot.units.length;
-      const soldPayouts = lot.units.filter(u=>u.status==="Sold"&&u.actualSalePrice).reduce((s,u)=>s+calcPayout(u.actualSalePrice),0);
-      soldUnits   += lot.units.filter(u=>u.status==="Sold").length;
-      inStockUnits += lot.units.filter(u=>u.status!=="Sold").length;
-      realizedProfit += soldPayouts - lotCost;
-      lot.units.filter(u=>u.status!=="Sold").forEach(u => {
-        const goal = parseFloat(u.goalSellPrice)||0;
-        if (goal > 0) projectedProfit += calcPayout(goal) - perUnit;
+function flattenRows(lots: Lot[]) {
+  const rows: any[] = [];
+  lots.forEach((lot) => {
+    const qty = lotQty(lot);
+    const productUnit = productCostPerUnit(lot);
+    const shipUnit = shippingPerUnit(lot);
+    const unitTotal = totalCostPerUnit(lot);
+    lot.units.forEach((unit, index) => {
+      const payout = unit.actualSalePrice ? calcPayout(unit.actualSalePrice) : null;
+      rows.push({
+        lotId: lot.id, unitId: unit.id, lotName: lot.name, unitName: unit.name, condition: lot.condition, source: lot.source,
+        unitsInLot: qty, lotProductCost: lotProductCost(lot).toFixed(2), lotShipping: lotShipping(lot).toFixed(2), lotTotalCost: lotTotal(lot).toFixed(2),
+        productCostPerUnit: productUnit.toFixed(2), shippingPerUnit: shipUnit.toFixed(2), costPerUnit: unitTotal.toFixed(2), breakEven: calcBreakEven(unitTotal).toFixed(2),
+        goalSellPrice: unit.goalSellPrice || "", status: unit.status, actualSalePrice: unit.actualSalePrice || "", payoutAfterFees: payout !== null ? payout.toFixed(2) : "", profitVsCost: payout !== null ? (payout - unitTotal).toFixed(2) : "", notes: index === 0 ? (lot.notes || "") : (unit.notes || ""), syncedAt: new Date().toISOString()
       });
     });
-    return { totalInvested, realizedProfit, projectedProfit, soldUnits, inStockUnits };
-  }, [lots]);
+  });
+  return rows;
+}
 
-  // ── CRUD ──
-  function saveLot() {
-    if (!form.name || !form.totalCostPaid) return;
-    if (editLotId !== null) {
-      setLots(prev => prev.map(l => {
-        if (l.id !== editLotId) return l;
-        const newQty = parseInt(form.quantity)||1;
-        let units = [...l.units];
-        if (newQty > units.length) {
-          for (let i = units.length; i < newQty; i++)
-            units.push({ id: Date.now()+i, name: `${form.name} #${i+1}`, status:"In Stock", goalSellPrice: form.goalSellPrice||"", actualSalePrice:"" });
-        } else { units = units.slice(0, newQty); }
-        return { ...form, id: editLotId, units };
-      }));
-      setEditLotId(null);
+async function syncToSheets(scriptUrl: string, lots: Lot[]) {
+  if (!scriptUrl) throw new Error("No Google Apps Script URL set");
+  await fetch(scriptUrl, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action: "sync", rows: flattenRows(lots) }) });
+  return true;
+}
+
+function fetchJsonp(url: string, timeoutMs = 15000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const callbackName = `jsonp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const sep = url.includes("?") ? "&" : "?";
+    const script = document.createElement("script");
+    let done = false;
+    const cleanup = () => { if (done) return; done = true; try { delete (window as any)[callbackName]; } catch { (window as any)[callbackName] = undefined; } if (script.parentNode) script.parentNode.removeChild(script); clearTimeout(timer); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error("Google Sheets read timed out")); }, timeoutMs);
+    (window as any)[callbackName] = (data: any) => { cleanup(); resolve(data); };
+    script.onerror = () => { cleanup(); reject(new Error("Google Sheets read failed")); };
+    script.src = `${url}${sep}action=read&callback=${callbackName}&t=${Date.now()}`;
+    document.body.appendChild(script);
+  });
+}
+
+function rebuildLotsFromRows(rows: any[]): Lot[] {
+  const map: Record<string, Lot> = {};
+  rows.filter(Boolean).forEach((row, idx) => {
+    const lotName = String(row["Lot Name"] || row.lotName || "Untitled Lot").trim();
+    const source = String(row["Source"] || row.source || "Other").trim();
+    const condition = String(row["Condition"] || row.condition || "New (sealed)").trim();
+    const key = String(row["Lot ID"] || row.lotId || `${lotName}|${source}|${condition}`);
+    const qty = num(row["Units In Lot"] || row.unitsInLot) || 1;
+    const productTotal = row["Product Cost Total"] !== undefined ? row["Product Cost Total"] : row.lotProductCost;
+    const shippingTotal = row["Shipping Total"] !== undefined ? row["Shipping Total"] : row.lotShipping;
+    const legacyTotal = row["Lot Total Cost"] !== undefined ? row["Lot Total Cost"] : row.lotTotalCost;
+    if (!map[key]) {
+      let product = num(productTotal);
+      let shipping = num(shippingTotal);
+      if (!product && !shipping && legacyTotal !== undefined) product = num(legacyTotal);
+      map[key] = { id: key, name: lotName, condition, source, totalCostPaid: product ? String(product) : "", inboundShipping: shipping ? String(shipping) : "", quantity: String(qty), goalSellPrice: "", notes: String(row["Notes"] || row.notes || ""), units: [] };
     } else {
-      const units = makeUnits(parseInt(form.quantity)||1, form.goalSellPrice, form.name);
-      setLots(prev => [...prev, { ...form, id: Date.now(), units }]);
+      if (!map[key].totalCostPaid && num(productTotal)) map[key].totalCostPaid = String(num(productTotal));
+      if (!map[key].inboundShipping && num(shippingTotal)) map[key].inboundShipping = String(num(shippingTotal));
+      if (!map[key].notes && (row["Notes"] || row.notes)) map[key].notes = String(row["Notes"] || row.notes);
     }
-    setForm(EMPTY_FORM);
-    setView("inventory");
-  }
+    map[key].units.push({ id: String(row["Unit ID"] || row.unitId || `${key}_${idx}`), name: String(row["Unit Name"] || row.unitName || lotName), status: STATUSES.includes(String(row["Status"] || row.status)) ? String(row["Status"] || row.status) : "In Stock", goalSellPrice: row["Goal Price"] !== undefined ? String(row["Goal Price"] || "") : String(row.goalSellPrice || ""), actualSalePrice: row["Sold For"] !== undefined ? String(row["Sold For"] || "") : String(row.actualSalePrice || ""), notes: "" });
+  });
+  return Object.values(map).map((lot) => ({ ...lot, quantity: String(lot.units.length) }));
+}
 
-  function updateUnit(lotId, unitId, changes) {
-    setLots(prev => prev.map(l =>
-      l.id !== lotId ? l : { ...l, units: l.units.map(u => u.id !== unitId ? u : { ...u, ...changes }) }
-    ));
-  }
-
-  function deleteLot(id) { setLots(prev => prev.filter(l => l.id !== id)); setView("inventory"); }
-
-  const detailLot = lots.find(l => l.id === detailLotId);
-  const filteredLots = filterStatus === "All" ? lots : lots.filter(l => l.units.some(u => u.status === filterStatus));
-  const totalCost = (parseFloat(form.totalCostPaid)||0) + (parseFloat(form.inboundShipping)||0);
-  const qty       = parseInt(form.quantity)||1;
-  const perUnitCost = totalCost / qty;
-  const breakEven   = totalCost > 0 ? calcBreakEven(perUnitCost) : null;
-  const goalPayout  = form.goalSellPrice ? calcPayout(form.goalSellPrice) : null;
-  const goalProfit  = goalPayout !== null ? goalPayout - perUnitCost : null;
-
-  // ── STYLES ──
-  const bg   = "linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%)";
-  const card = { background:"rgba(255,255,255,0.05)", borderRadius:16, border:"1px solid rgba(255,255,255,0.08)", padding:16, marginBottom:12 };
-  const inp  = { width:"100%", boxSizing:"border-box", background:"rgba(255,255,255,0.07)", border:"1.5px solid rgba(255,255,255,0.12)", borderRadius:10, padding:"11px 12px", color:"#f0eeff", fontSize:15, fontWeight:500, outline:"none", fontFamily:"inherit" };
-  const pill = (active, color="#7c3aed") => ({ padding:"6px 14px", borderRadius:20, border:`1.5px solid ${active ? color : "rgba(255,255,255,0.12)"}`, background: active ? `${color}30` : "transparent", color: active ? "#e9d5ff" : "#6b7280", fontWeight:600, fontSize:12, cursor:"pointer" });
-
-  const syncBadgeColor = syncStatus === "syncing" ? "#f59e0b" : syncStatus === "success" ? "#22c55e" : syncStatus === "error" ? "#ef4444" : settings.lastSynced ? "#60a5fa" : "#4b5563";
-  const syncBadgeText  = syncStatus === "syncing" ? "⏳ Syncing..." : syncStatus === "success" ? "✓ Synced!" : syncStatus === "error" ? "✗ Sync failed" : settings.lastSynced ? `☁ ${fmtDate(settings.lastSynced)}` : "☁ Not synced";
-
-  return (
-    <div style={{ minHeight:"100vh", background:bg, fontFamily:"'Inter','Segoe UI',sans-serif", color:"#f0eeff", paddingBottom:90 }}>
-
-      {/* ── HEADER ── */}
-      <div style={{ textAlign:"center", padding:"22px 16px 10px", position:"relative" }}>
-        <div style={{ fontSize:28, marginBottom:2 }}>🧸</div>
-        <h1 style={{ margin:0, fontSize:21, fontWeight:900, background:"linear-gradient(90deg,#a78bfa,#f0abfc)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>Dahlia's Tonie Tracker</h1>
-        <p style={{ margin:"3px 0 0", fontSize:11, color:"#c4b5fd", opacity:0.6, fontStyle:"italic" }}>with love, Levy Yitschock 💕</p>
-
-        {/* Sync badge + settings gear */}
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:8, marginTop:8 }}>
-          <span style={{ fontSize:11, color:syncBadgeColor, fontWeight:600, background:`${syncBadgeColor}18`, padding:"3px 10px", borderRadius:8 }}>
-            {syncBadgeText}
-          </span>
-          {settings.syncMode === "manual" && settings.scriptUrl && (<>
-            <button onClick={doSync} disabled={syncStatus==="syncing"}
-              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#a78bfa", fontWeight:600, cursor:"pointer" }}>
-              ↑ Push
-            </button>
-            <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
-              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#60a5fa", fontWeight:600, cursor:"pointer" }}>
-              ↓ Pull
-            </button>
-          </>)}
-          {settings.syncMode === "export" && settings.scriptUrl && (<>
-            <button onClick={doSync} disabled={syncStatus==="syncing"}
-              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#a78bfa", fontWeight:600, cursor:"pointer" }}>
-              ↑ Export
-            </button>
-            <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
-              style={{ fontSize:11, padding:"3px 10px", borderRadius:8, border:"1px solid rgba(255,255,255,0.15)", background:"rgba(255,255,255,0.06)", color:"#60a5fa", fontWeight:600, cursor:"pointer" }}>
-              ↓ Import
-            </button>
-          </>)}
-          <button onClick={() => setView("settings")}
-            style={{ fontSize:16, background:"none", border:"none", cursor:"pointer", color:"#4b5563", padding:"0 4px" }}>⚙️</button>
-        </div>
-        {savedFlash && (
-          <div style={{ position:"absolute", top:12, right:16, fontSize:11, color:"#22c55e", fontWeight:700, background:"rgba(34,197,94,0.1)", padding:"4px 10px", borderRadius:8 }}>✓ Saved</div>
-        )}
-      </div>
-
-      <div style={{ padding:"0 16px" }}>
-
-        {/* ══════════════════════════════════════
-            SETTINGS VIEW
-        ══════════════════════════════════════ */}
-        {view === "settings" && (
-          <div>
-            <button onClick={() => setView("dashboard")} style={{ background:"none", border:"none", color:"#a78bfa", fontWeight:700, fontSize:14, cursor:"pointer", marginBottom:14, padding:0 }}>← Back</button>
-            <h2 style={{ margin:"0 0 16px", fontSize:18, fontWeight:800 }}>⚙️ Settings</h2>
-
-            {/* Google Sheets Setup */}
-            <div style={card}>
-              <div style={{ fontSize:13, fontWeight:800, color:"#a78bfa", marginBottom:12 }}>☁️ Google Sheets Sync</div>
-
-              {/* Step by step instructions */}
-              <div style={{ background:"rgba(255,255,255,0.03)", borderRadius:10, padding:"12px 14px", marginBottom:14, fontSize:12, color:"#9ca3af", lineHeight:1.7 }}>
-                <div style={{ color:"#e9d5ff", fontWeight:700, marginBottom:6 }}>📋 Setup Instructions (one time only):</div>
-                <div>1. Open <strong style={{color:"#a78bfa"}}>Google Sheets</strong> and create a new spreadsheet</div>
-                <div>2. Click <strong style={{color:"#a78bfa"}}>Extensions → Apps Script</strong></div>
-                <div>3. Delete all existing code, paste in the Apps Script below</div>
-                <div>4. Click <strong style={{color:"#a78bfa"}}>Deploy → New deployment → Web App</strong></div>
-                <div>5. Set "Who has access" to <strong style={{color:"#a78bfa"}}>Anyone</strong></div>
-                <div>6. Copy the Web App URL and paste it below</div>
-              </div>
-
-              {/* Apps Script code to copy */}
-              <div style={{ marginBottom:14 }}>
-                <div style={{ fontSize:11, color:"#6b7280", fontWeight:700, textTransform:"uppercase", letterSpacing:0.8, marginBottom:6 }}>Apps Script Code (copy this):</div>
-                <div style={{ background:"#0d0b1e", border:"1px solid rgba(255,255,255,0.1)", borderRadius:10, padding:"10px 12px", fontSize:11, color:"#a78bfa", fontFamily:"monospace", lineHeight:1.6, overflowX:"auto", whiteSpace:"pre" }}>
-{`// ── PASTE THIS ENTIRE SCRIPT INTO APPS SCRIPT ──
-
-function doPost(e) {
+const APPS_SCRIPT_CODE = `function doPost(e) {
   try {
-    var data = JSON.parse(e.postData.contents);
-    var ss   = SpreadsheetApp.getActiveSpreadsheet();
-    if (data.action === "sync") {
-      writeInventory(ss, data.rows);
-    }
-    return ok({status:"ok"});
-  } catch(err) {
-    return ok({status:"error", msg: err.toString()});
+    var data = JSON.parse(e.postData.contents || '{}');
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (data.action === 'sync') writeInventory(ss, data.rows || []);
+    return output_({ status: 'ok' });
+  } catch (err) {
+    return output_({ status: 'error', message: String(err) });
   }
 }
 
 function doGet(e) {
-  // Two-way: app reads changes made directly in the sheet
   try {
-    var ss    = SpreadsheetApp.getActiveSpreadsheet();
-    var sheet = ss.getSheetByName("Inventory");
-    if (!sheet) return ok({rows:[]});
-    var data  = sheet.getDataRange().getValues();
-    var headers = data[0];
-    var rows = data.slice(1).map(function(row) {
-      var obj = {};
-      headers.forEach(function(h, i) { obj[h] = row[i]; });
-      return obj;
-    });
-    return ok({rows: rows});
-  } catch(err) {
-    return ok({rows:[], error: err.toString()});
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName('Inventory');
+    var rows = [];
+    if (sheet && sheet.getLastRow() > 1) {
+      var values = sheet.getDataRange().getValues();
+      var headers = values[0];
+      rows = values.slice(1).filter(function(r) { return r.join('').trim() !== ''; }).map(function(r) {
+        var obj = {};
+        headers.forEach(function(h, i) { obj[h] = r[i]; });
+        return obj;
+      });
+    }
+    return output_({ rows: rows }, e);
+  } catch (err) {
+    return output_({ rows: [], error: String(err) }, e);
   }
 }
 
 function writeInventory(ss, rows) {
-  var sheet = ss.getSheetByName("Inventory")
-    || ss.insertSheet("Inventory");
+  var sheet = ss.getSheetByName('Inventory') || ss.insertSheet('Inventory');
   sheet.clearContents();
   sheet.clearFormats();
 
   var headers = [
-    "Lot Name","Unit Name","Condition","Source",
-    "Lot Total Cost","Shipping/Unit","Cost/Unit",
-    "Break Even","Goal Price","Status",
-    "Sold For","Payout","Profit","Notes","Synced At"
+    'Lot ID','Unit ID','Lot Name','Unit Name','Condition','Source','Units In Lot',
+    'Product Cost Total','Shipping Total','Lot Total Cost',
+    'Product Cost / Unit','Shipping / Unit','Total Cost / Unit','Break Even',
+    'Goal Price','Status','Sold For','Payout','Profit','Notes','Synced At'
   ];
   sheet.appendRow(headers);
 
   rows.forEach(function(r) {
     sheet.appendRow([
-      r.lotName, r.unitName, r.condition, r.source,
-      Number(r.lotTotalCost), Number(r.shippingPerUnit),
-      Number(r.costPerUnit), Number(r.breakEven),
-      r.goalSellPrice ? Number(r.goalSellPrice) : "",
-      r.status,
-      r.actualSalePrice ? Number(r.actualSalePrice) : "",
-      r.payoutAfterFees ? Number(r.payoutAfterFees) : "",
-      r.profitVsCost ? Number(r.profitVsCost) : "",
-      r.notes, r.syncedAt
+      r.lotId, r.unitId, r.lotName, r.unitName, r.condition, r.source, Number(r.unitsInLot || 1),
+      Number(r.lotProductCost || 0), Number(r.lotShipping || 0), Number(r.lotTotalCost || 0),
+      Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.costPerUnit || 0), Number(r.breakEven || 0),
+      r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'In Stock',
+      r.actualSalePrice ? Number(r.actualSalePrice) : '', r.payoutAfterFees ? Number(r.payoutAfterFees) : '', r.profitVsCost ? Number(r.profitVsCost) : '',
+      r.notes || '', r.syncedAt || new Date().toISOString()
     ]);
   });
 
-  // ── STYLING ──
-  var lastRow = sheet.getLastRow();
+  var lastRow = Math.max(sheet.getLastRow(), 1);
   var lastCol = headers.length;
-  var fullRange = sheet.getRange(1, 1, lastRow, lastCol);
-
-  // Font & borders
-  fullRange.setFontFamily("Arial");
-  fullRange.setFontSize(10);
-  fullRange.setBorder(true,true,true,true,true,true,"#e0e0e0",SpreadsheetApp.BorderStyle.SOLID);
-
-  // Header row styling
-  var headerRange = sheet.getRange(1, 1, 1, lastCol);
-  headerRange.setBackground("#4a235a");
-  headerRange.setFontColor("#ffffff");
-  headerRange.setFontWeight("bold");
-  headerRange.setFontSize(11);
-
-  // Alternate row colors
-  for (var i = 2; i <= lastRow; i++) {
-    var rowRange = sheet.getRange(i, 1, 1, lastCol);
-    rowRange.setBackground(i % 2 === 0 ? "#f8f0ff" : "#ffffff");
-    rowRange.setFontColor("#222222");
-  }
-
-  // Status column color coding (col 10)
+  var full = sheet.getRange(1, 1, lastRow, lastCol);
+  full.setFontFamily('Arial').setFontSize(10).setBorder(true, true, true, true, true, true, '#e0e0e0', SpreadsheetApp.BorderStyle.SOLID);
+  sheet.getRange(1, 1, 1, lastCol).setBackground('#4a235a').setFontColor('#ffffff').setFontWeight('bold').setFontSize(11);
+  for (var i = 2; i <= lastRow; i++) sheet.getRange(i, 1, 1, lastCol).setBackground(i % 2 === 0 ? '#f8f0ff' : '#ffffff').setFontColor('#222222');
   for (var j = 2; j <= lastRow; j++) {
-    var statusCell = sheet.getRange(j, 10);
+    var statusCell = sheet.getRange(j, 16);
     var val = statusCell.getValue();
-    if (val === "Sold")     { statusCell.setBackground("#d4edda"); statusCell.setFontColor("#155724"); statusCell.setFontWeight("bold"); }
-    if (val === "Listed")   { statusCell.setBackground("#fff3cd"); statusCell.setFontColor("#856404"); statusCell.setFontWeight("bold"); }
-    if (val === "In Stock") { statusCell.setBackground("#cce5ff"); statusCell.setFontColor("#004085"); statusCell.setFontWeight("bold"); }
+    if (val === 'Sold') statusCell.setBackground('#d4edda').setFontColor('#155724').setFontWeight('bold');
+    if (val === 'Listed') statusCell.setBackground('#fff3cd').setFontColor('#856404').setFontWeight('bold');
+    if (val === 'In Stock') statusCell.setBackground('#cce5ff').setFontColor('#004085').setFontWeight('bold');
+    var profitCell = sheet.getRange(j, 19);
+    var p = profitCell.getValue();
+    if (p !== '') profitCell.setFontColor(Number(p) >= 0 ? '#155724' : '#721c24').setFontWeight('bold');
   }
-
-  // Profit column — green/red (col 13)
-  for (var k = 2; k <= lastRow; k++) {
-    var profitCell = sheet.getRange(k, 13);
-    var pval = profitCell.getValue();
-    if (pval !== "") {
-      profitCell.setFontColor(pval >= 0 ? "#155724" : "#721c24");
-      profitCell.setFontWeight("bold");
-    }
-  }
-
-  // Currency format for number columns
-  var currencyCols = [5,6,7,8,9,11,12,13];
-  currencyCols.forEach(function(col) {
-    if (lastRow > 1) {
-      sheet.getRange(2, col, lastRow-1, 1)
-        .setNumberFormat("\"$\"#,##0.00");
-    }
+  [8,9,10,11,12,13,14,15,17,18,19].forEach(function(col) {
+    if (lastRow > 1) sheet.getRange(2, col, lastRow - 1, 1).setNumberFormat('"$"#,##0.00');
   });
-
-  // Auto-resize all columns
-  for (var c = 1; c <= lastCol; c++) {
-    sheet.autoResizeColumn(c);
-  }
-
-  // Freeze header row
+  for (var c = 1; c <= lastCol; c++) sheet.autoResizeColumn(c);
   sheet.setFrozenRows(1);
 }
 
-function ok(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}`}
-                </div>
-              </div>
+function output_(obj, e) {
+  var text = JSON.stringify(obj);
+  if (e && e.parameter && e.parameter.callback) {
+    return ContentService.createTextOutput(e.parameter.callback + '(' + text + ');').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(text).setMimeType(ContentService.MimeType.JSON);
+}`;
 
-              {/* Script URL input */}
-              <Field label="Your Web App URL">
-                <input style={inp} value={settings.scriptUrl} placeholder="https://script.google.com/macros/s/..." onChange={e => setSettings(s => ({ ...s, scriptUrl: e.target.value.trim() }))} />
-              </Field>
+export default function App() {
+  const [lots, setLots] = useState<Lot[]>(() => {
+    try {
+      const current = localStorage.getItem(STORAGE_KEY);
+      const old = localStorage.getItem(OLD_STORAGE_KEY);
+      const parsed = JSON.parse(current || old || "[]");
+      return Array.isArray(parsed) ? parsed.map(normalizeLot) : [];
+    } catch { return []; }
+  });
+  const [settings, setSettings] = useState<Settings>(() => {
+    try {
+      const current = localStorage.getItem(SETTINGS_KEY);
+      const old = localStorage.getItem(OLD_SETTINGS_KEY);
+      const saved = JSON.parse(current || old || "{}");
+      return { scriptUrl: DEFAULT_SCRIPT_URL, syncMode: "auto", lastSynced: null, ...saved, scriptUrl: DEFAULT_SCRIPT_URL };
+    } catch { return { scriptUrl: DEFAULT_SCRIPT_URL, syncMode: "auto", lastSynced: null }; }
+  });
+  const [view, setView] = useState("dashboard");
+  const [form, setForm] = useState<any>(EMPTY_FORM);
+  const [editLotId, setEditLotId] = useState<string | number | null>(null);
+  const [filterStatus, setFilterStatus] = useState("All");
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  const [message, setMessage] = useState("");
+  const autoTimer = useRef<any>(null);
+  const initialCloudLoadDone = useRef(false);
+  const skipNextAutoPush = useRef(false);
 
-              {/* Sync mode */}
-              <Field label="Sync Mode">
-                <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-                  {[
-                    ["auto",   "🔄 Auto",   "Syncs to Google Sheets every time you make a change (3 second delay)"],
-                    ["manual", "👆 Manual", "You tap 'Sync now' in the header whenever you want"],
-                    ["export", "📤 Export", "One button push — sends everything at once when you're ready"],
-                  ].map(([val, label, desc]) => (
-                    <div key={val} onClick={() => setSettings(s => ({ ...s, syncMode: val }))}
-                      style={{ padding:"10px 14px", borderRadius:12, border:`1.5px solid ${settings.syncMode===val ? "#7c3aed" : "rgba(255,255,255,0.08)"}`, background: settings.syncMode===val ? "rgba(124,58,237,0.12)" : "rgba(255,255,255,0.02)", cursor:"pointer" }}>
-                      <div style={{ fontWeight:700, fontSize:13, color: settings.syncMode===val ? "#e9d5ff" : "#9ca3af" }}>{label}</div>
-                      <div style={{ fontSize:12, color:"#4b5563", marginTop:2 }}>{desc}</div>
-                    </div>
-                  ))}
-                </div>
-              </Field>
+  useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(lots)); } catch {} }, [lots]);
+  useEffect(() => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} }, [settings]);
+  useEffect(() => { pullFromSheets(true); }, []);
+  useEffect(() => {
+    if (!initialCloudLoadDone.current) return;
+    if (skipNextAutoPush.current) { skipNextAutoPush.current = false; return; }
+    if (settings.syncMode === "auto" && settings.scriptUrl && lots.length) {
+      clearTimeout(autoTimer.current);
+      autoTimer.current = setTimeout(() => doSync(true), 2500);
+    }
+  }, [lots]);
 
-              {settings.scriptUrl && (
-                <div style={{ display:"flex", gap:8, marginTop:4 }}>
-                  <button onClick={doSync} disabled={syncStatus==="syncing"}
-                    style={{ flex:1, padding:"12px 0", borderRadius:12, border:"none", background:"linear-gradient(135deg,#7c3aed,#a855f7)", color:"#fff", fontWeight:700, fontSize:14, cursor:"pointer" }}>
-                    {syncStatus==="syncing" ? "⏳..." : "↑ Push to Sheets"}
-                  </button>
-                  <button onClick={pullFromSheets} disabled={syncStatus==="syncing"}
-                    style={{ flex:1, padding:"12px 0", borderRadius:12, border:"1.5px solid #60a5fa", background:"rgba(96,165,250,0.1)", color:"#60a5fa", fontWeight:700, fontSize:14, cursor:"pointer" }}>
-                    {syncStatus==="syncing" ? "⏳..." : "↓ Pull from Sheets"}
-                  </button>
-                </div>
-              )}
-              {settings.lastSynced && (
-                <div style={{ textAlign:"center", fontSize:11, color:"#4b5563", marginTop:8 }}>Last synced: {fmtDate(settings.lastSynced)}</div>
-              )}
-            </div>
+  const allUnits = useMemo(() => lots.flatMap(lot => lot.units.map(unit => ({ lot, unit, productUnit: productCostPerUnit(lot), shipUnit: shippingPerUnit(lot), unitCost: totalCostPerUnit(lot), breakEven: calcBreakEven(totalCostPerUnit(lot)) }))), [lots]);
+  const filteredUnits = filterStatus === "All" ? allUnits : allUnits.filter(x => x.unit.status === filterStatus);
+  const stats = useMemo(() => {
+    const totalInvested = lots.reduce((s, l) => s + lotTotal(l), 0);
+    const sold = allUnits.filter(x => x.unit.status === "Sold");
+    const open = allUnits.filter(x => x.unit.status !== "Sold");
+    const realizedProfit = sold.reduce((s, x) => s + (x.unit.actualSalePrice ? calcPayout(x.unit.actualSalePrice) - x.unitCost : -x.unitCost), 0);
+    const projectedProfit = open.reduce((s, x) => s + (x.unit.goalSellPrice ? calcPayout(x.unit.goalSellPrice) - x.unitCost : 0), 0);
+    return { totalInvested, soldUnits: sold.length, inStockUnits: open.length, realizedProfit, projectedProfit, totalUnits: allUnits.length };
+  }, [lots, allUnits]);
 
-            {/* Danger zone */}
-            <div style={{ ...card, border:"1px solid rgba(239,68,68,0.2)", background:"rgba(239,68,68,0.04)" }}>
-              <div style={{ fontSize:13, fontWeight:800, color:"#f87171", marginBottom:10 }}>⚠️ Danger Zone</div>
-              <button onClick={() => { if(window.confirm("Delete ALL data? This cannot be undone.")) { setLots([]); setView("dashboard"); } }}
-                style={{ width:"100%", padding:"11px 0", borderRadius:10, border:"1.5px solid #ef4444", background:"transparent", color:"#f87171", fontWeight:700, fontSize:14, cursor:"pointer" }}>
-                🗑️ Clear All Data
-              </button>
-            </div>
-          </div>
-        )}
+  async function doSync(silent = false) {
+    if (!settings.scriptUrl) { if (!silent) flash("Missing Google Apps Script URL"); setSyncStatus("error"); return; }
+    setSyncStatus("syncing");
+    try {
+      await syncToSheets(settings.scriptUrl, lots);
+      setSettings(s => ({ ...s, lastSynced: Date.now(), scriptUrl: DEFAULT_SCRIPT_URL }));
+      setSyncStatus("success");
+      if (!silent) flash("Pushed to Google Sheets");
+    } catch (e: any) { setSyncStatus("error"); if (!silent) flash(e?.message || "Sync failed"); }
+    setTimeout(() => setSyncStatus(null), 2500);
+  }
 
-        {/* ══════════════════════════════════════
-            DASHBOARD
-        ══════════════════════════════════════ */}
-        {view === "dashboard" && (
-          <div>
-            {lots.length === 0 ? (
-              <div style={{ ...card, textAlign:"center", padding:32 }}>
-                <div style={{ fontSize:40, marginBottom:12 }}>📦</div>
-                <p style={{ color:"#6b7280", margin:"0 0 16px" }}>No Tonies yet — add your first purchase!</p>
-                <button onClick={() => setView("add")} style={{ padding:"10px 24px", borderRadius:10, border:"none", background:"linear-gradient(135deg,#7c3aed,#a855f7)", color:"#fff", fontWeight:700, cursor:"pointer", fontSize:14 }}>+ Add Tonie</button>
-              </div>
-            ) : (<>
-              <div style={{ ...card, background:"rgba(34,197,94,0.08)", border:"1px solid rgba(34,197,94,0.2)" }}>
-                <div style={{ fontSize:11, color:"#86efac", textTransform:"uppercase", letterSpacing:1, marginBottom:10, fontWeight:700 }}>✅ Already Sold</div>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
-                  <Stat label="Units Sold" value={`${stats.soldUnits}`} unit="tonies" color="#22c55e" />
-                  <Stat label="Profit in Pocket" value={fmt(stats.realizedProfit)} color={stats.realizedProfit>=0?"#22c55e":"#ef4444"} big />
-                </div>
-                <div style={{ marginTop:8, fontSize:11, color:"#4ade80", opacity:0.7 }}>All payouts received minus full lot costs paid</div>
-              </div>
+  async function pullFromSheets(silent = false) {
+    if (!settings.scriptUrl) { if (!silent) flash("Missing Google Apps Script URL"); return; }
+    setSyncStatus("syncing");
+    try {
+      const data = await fetchJsonp(settings.scriptUrl);
+      if (!data || data.error) throw new Error(data?.error || "Bad Google response");
+      const nextLots = rebuildLotsFromRows(data.rows || []);
+      skipNextAutoPush.current = true;
+      setLots(nextLots);
+      setSettings(s => ({ ...s, lastSynced: Date.now(), scriptUrl: DEFAULT_SCRIPT_URL }));
+      setSyncStatus("success");
+      if (!silent) flash(`Pulled ${nextLots.reduce((n, l) => n + l.units.length, 0)} units from Sheets`);
+    } catch (e: any) { setSyncStatus("error"); if (!silent) flash(e?.message || "Pull failed"); }
+    finally { initialCloudLoadDone.current = true; }
+    setTimeout(() => setSyncStatus(null), 3000);
+  }
 
-              <div style={{ ...card, background:"rgba(168,85,247,0.08)", border:"1px solid rgba(168,85,247,0.2)" }}>
-                <div style={{ fontSize:11, color:"#c4b5fd", textTransform:"uppercase", letterSpacing:1, marginBottom:10, fontWeight:700 }}>🎯 Still to Sell (at Goal Prices)</div>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
-                  <Stat label="Units Left" value={`${stats.inStockUnits}`} unit="tonies" color="#a78bfa" />
-                  <Stat label="Potential Profit" value={fmt(stats.projectedProfit)} color="#a78bfa" big />
-                </div>
-              </div>
+  function flash(text: string) { setMessage(text); setTimeout(() => setMessage(""), 3000); }
 
-              <div style={{ ...card, background:"rgba(249,168,37,0.07)", border:"1px solid rgba(249,168,37,0.2)" }}>
-                <div style={{ fontSize:11, color:"#fcd34d", textTransform:"uppercase", letterSpacing:1, marginBottom:10, fontWeight:700 }}>💰 Full Picture</div>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
-                  <Stat label="Total Invested" value={fmt(stats.totalInvested)} color="#fbbf24" big />
-                  <Stat label="Total Profit" value={fmt(stats.realizedProfit+stats.projectedProfit)} color={(stats.realizedProfit+stats.projectedProfit)>=0?"#fbbf24":"#ef4444"} big />
-                </div>
-              </div>
+  function saveLot() {
+    if (!form.name || !form.totalCostPaid) return;
+    const qty = Math.max(1, parseInt(form.quantity) || 1);
+    if (editLotId !== null) {
+      setLots(prev => prev.map(l => {
+        if (l.id !== editLotId) return l;
+        let units = [...l.units];
+        if (qty > units.length) for (let i = units.length; i < qty; i++) units.push({ id: uid(), name: `${form.name} #${i + 1}`, status: "In Stock", goalSellPrice: form.goalSellPrice || "", actualSalePrice: "" });
+        if (qty < units.length) units = units.slice(0, qty);
+        return normalizeLot({ ...l, ...form, units });
+      }));
+      setEditLotId(null);
+    } else setLots(prev => [...prev, normalizeLot({ ...form, id: uid(), units: makeUnits(qty, form.goalSellPrice, form.name) })]);
+    setForm(EMPTY_FORM); setView("inventory");
+  }
 
-              <div style={{ marginTop:4 }}>
-                <div style={{ fontSize:11, color:"#6b7280", marginBottom:8, fontWeight:700, textTransform:"uppercase", letterSpacing:0.8 }}>Recent Purchases</div>
-                {[...lots].reverse().slice(0,4).map(lot => {
-                  const lotCost = (parseFloat(lot.totalCostPaid)||0)+(parseFloat(lot.inboundShipping)||0);
-                  const sold = lot.units.filter(u=>u.status==="Sold").length;
-                  const pct  = Math.round((sold/lot.units.length)*100);
-                  return (
-                    <div key={lot.id} onClick={() => { setDetailLotId(lot.id); setView("detail"); }}
-                      style={{ ...card, cursor:"pointer", marginBottom:8, padding:"12px 14px" }}>
-                      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
-                        <div>
-                          <div style={{ fontWeight:700 }}>{lot.name}</div>
-                          <div style={{ fontSize:12, color:"#6b7280", marginTop:1 }}>{lot.units.length} units · {fmt(lotCost)}</div>
-                        </div>
-                        <div style={{ fontSize:12, color:"#22c55e", fontWeight:700 }}>{sold}/{lot.units.length} sold</div>
-                      </div>
-                      <div style={{ height:4, background:"rgba(255,255,255,0.08)", borderRadius:4, overflow:"hidden" }}>
-                        <div style={{ height:"100%", width:`${pct}%`, background:"linear-gradient(90deg,#7c3aed,#22c55e)", borderRadius:4 }} />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </>)}
-          </div>
-        )}
+  function updateUnit(lotId: any, unitId: any, changes: Partial<Unit>) {
+    setLots(prev => prev.map(l => l.id !== lotId ? l : { ...l, units: l.units.map(u => u.id !== unitId ? u : { ...u, ...changes }) }));
+  }
+  function deleteUnit(lotId: any, unitId: any) {
+    setLots(prev => prev.map(l => l.id !== lotId ? l : { ...l, units: l.units.filter(u => u.id !== unitId), quantity: String(Math.max(0, l.units.length - 1)) }).filter(l => l.units.length));
+  }
+  function editLot(lot: Lot) { setForm({ name: lot.name, condition: lot.condition, source: lot.source, totalCostPaid: lot.totalCostPaid, inboundShipping: lot.inboundShipping, quantity: String(lot.units.length), goalSellPrice: lot.goalSellPrice || "", notes: lot.notes || "" }); setEditLotId(lot.id); setView("add"); }
 
-        {/* ══════════════════════════════════════
-            INVENTORY
-        ══════════════════════════════════════ */}
-        {view === "inventory" && (
-          <div>
-            <div style={{ display:"flex", gap:6, marginBottom:14, flexWrap:"wrap" }}>
-              {["All","In Stock","Listed","Sold"].map(s => (
-                <button key={s} onClick={() => setFilterStatus(s)} style={pill(filterStatus===s, statusColor[s]||"#7c3aed")}>
-                  {s} ({s==="All" ? lots.reduce((n,l)=>n+l.units.length,0) : lots.reduce((n,l)=>n+l.units.filter(u=>u.status===s).length,0)})
-                </button>
-              ))}
-            </div>
-            {filteredLots.length === 0
-              ? <div style={{ ...card, textAlign:"center", padding:32 }}><p style={{ color:"#6b7280", margin:0 }}>No items here.</p></div>
-              : filteredLots.map(lot => {
-                const lotCost = (parseFloat(lot.totalCostPaid)||0)+(parseFloat(lot.inboundShipping)||0);
-                const sold = lot.units.filter(u=>u.status==="Sold").length;
-                const soldPayouts = lot.units.filter(u=>u.status==="Sold"&&u.actualSalePrice).reduce((s,u)=>s+calcPayout(u.actualSalePrice),0);
-                const profit = soldPayouts - lotCost;
-                return (
-                  <div key={lot.id} onClick={() => { setDetailLotId(lot.id); setView("detail"); }}
-                    style={{ ...card, cursor:"pointer", marginBottom:10 }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
-                      <div>
-                        <div style={{ fontWeight:800, fontSize:15 }}>{lot.name}</div>
-                        <div style={{ fontSize:12, color:"#6b7280", marginTop:2 }}>{lot.condition} · {lot.source}</div>
-                      </div>
-                      <div style={{ textAlign:"right" }}>
-                        <div style={{ fontSize:12, color:"#22c55e", fontWeight:700 }}>{sold}/{lot.units.length} sold</div>
-                        {sold > 0 && <div style={{ fontSize:12, color:profit>=0?"#22c55e":"#ef4444", marginTop:2 }}>{fmt(profit)}</div>}
-                      </div>
-                    </div>
-                    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:8 }}>
-                      <MiniStat label="Total Cost" value={fmt(lotCost)} />
-                      <MiniStat label="Min/unit" value={fmt(calcBreakEven(lotCost/lot.units.length))} color="#f59e0b" />
-                      <MiniStat label="Goal/unit" value={lot.goalSellPrice ? fmt(parseFloat(lot.goalSellPrice)) : "—"} color="#a78bfa" />
-                    </div>
-                    <div style={{ height:3, background:"rgba(255,255,255,0.07)", borderRadius:4, overflow:"hidden", marginTop:10 }}>
-                      <div style={{ height:"100%", width:`${Math.round((sold/lot.units.length)*100)}%`, background:"linear-gradient(90deg,#7c3aed,#22c55e)", borderRadius:4 }} />
-                    </div>
-                  </div>
-                );
-              })
-            }
-          </div>
-        )}
+  const totalCost = num(form.totalCostPaid) + num(form.inboundShipping);
+  const formQty = Math.max(1, parseInt(form.quantity) || 1);
+  const formProductUnit = num(form.totalCostPaid) / formQty;
+  const formShipUnit = num(form.inboundShipping) / formQty;
+  const formUnitCost = formProductUnit + formShipUnit;
+  const formBreakEven = totalCost > 0 ? calcBreakEven(formUnitCost) : null;
+  const syncText = syncStatus === "syncing" ? "⏳ Syncing" : syncStatus === "success" ? "✓ Synced" : syncStatus === "error" ? "✗ Failed" : settings.lastSynced ? `☁ ${dateText(settings.lastSynced)}` : "☁ Not synced";
 
-        {/* ══════════════════════════════════════
-            DETAIL
-        ══════════════════════════════════════ */}
-        {view === "detail" && detailLot && (() => {
-          const lotCost = (parseFloat(detailLot.totalCostPaid)||0)+(parseFloat(detailLot.inboundShipping)||0);
-          const perUnit = lotCost/detailLot.units.length;
-          const be = calcBreakEven(perUnit);
-          const totalSoldPayout = detailLot.units.filter(u=>u.status==="Sold"&&u.actualSalePrice).reduce((s,u)=>s+calcPayout(u.actualSalePrice),0);
-          const realProfit = totalSoldPayout - lotCost;
-          const projectedExtra = detailLot.units.filter(u=>u.status!=="Sold"&&u.goalSellPrice).reduce((s,u)=>s+calcPayout(u.goalSellPrice)-perUnit,0);
-          const sold = detailLot.units.filter(u=>u.status==="Sold").length;
-          return (
-            <div>
-              <button onClick={() => setView("inventory")} style={{ background:"none", border:"none", color:"#a78bfa", fontWeight:700, fontSize:14, cursor:"pointer", marginBottom:12, padding:0 }}>← Back</button>
-              <div style={card}>
-                <h2 style={{ margin:"0 0 4px", fontSize:19, fontWeight:900 }}>{detailLot.name}</h2>
-                <div style={{ fontSize:12, color:"#6b7280", marginBottom:14 }}>{detailLot.condition} · {detailLot.source}</div>
-                <Row label="Total cost paid" value={fmt(parseFloat(detailLot.totalCostPaid))} />
-                {detailLot.inboundShipping && <Row label="Inbound shipping" value={fmt(parseFloat(detailLot.inboundShipping))} />}
-                <Row label="Total invested" value={fmt(lotCost)} />
-                <Row label="Units in lot" value={`${detailLot.units.length} tonies`} />
-                <Row label="Cost per unit" value={fmt(perUnit)} />
-                <div style={{ height:1, background:"rgba(255,255,255,0.07)", margin:"10px 0" }} />
-                <Row label="⚠️ Break-even per unit" value={fmt(be)} color="#f59e0b" />
-                <Row label="🎯 Goal per unit" value={detailLot.goalSellPrice ? fmt(parseFloat(detailLot.goalSellPrice)) : "—"} color="#a78bfa" />
-                <div style={{ height:1, background:"rgba(255,255,255,0.07)", margin:"10px 0" }} />
-                <Row label="Payout from sold units" value={fmt(totalSoldPayout)} color="#22c55e" />
-                <Row label="Profit so far (payout − full lot cost)" value={fmt(realProfit)} color={realProfit>=0?"#22c55e":"#ef4444"} />
-                {projectedExtra !== 0 && <Row label="+ Projected from unsold" value={fmt(projectedExtra)} color="#a78bfa" />}
-                <div style={{ marginTop:12 }}>
-                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:"#6b7280", marginBottom:4 }}>
-                    <span>{sold}/{detailLot.units.length} sold</span><span>{Math.round((sold/detailLot.units.length)*100)}%</span>
-                  </div>
-                  <div style={{ height:6, background:"rgba(255,255,255,0.07)", borderRadius:4, overflow:"hidden" }}>
-                    <div style={{ height:"100%", width:`${Math.round((sold/detailLot.units.length)*100)}%`, background:"linear-gradient(90deg,#7c3aed,#22c55e)", borderRadius:4 }} />
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ fontSize:11, color:"#6b7280", fontWeight:700, textTransform:"uppercase", letterSpacing:0.8, marginBottom:8 }}>Individual Units ({detailLot.units.length})</div>
-              {detailLot.units.map((unit, i) => {
-                const unitPayout = unit.actualSalePrice ? calcPayout(unit.actualSalePrice) : null;
-                const unitProfit = unitPayout !== null ? unitPayout - perUnit : null;
-                return (
-                  <div key={unit.id} style={{ ...card, marginBottom:8 }}>
-                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10, gap:8 }}>
-                      <input value={unit.name||`Unit #${i+1}`} onChange={e => updateUnit(detailLot.id, unit.id, { name:e.target.value })}
-                        style={{ ...inp, padding:"6px 10px", fontSize:14, fontWeight:700, flex:1 }} placeholder={`Unit #${i+1}`} />
-                      <div style={{ display:"flex", gap:4, flexShrink:0 }}>
-                        {["In Stock","Listed","Sold"].map(s => (
-                          <button key={s} onClick={() => updateUnit(detailLot.id, unit.id, { status:s, actualSalePrice: s!=="Sold"?"":unit.actualSalePrice })}
-                            style={{ padding:"4px 8px", borderRadius:10, border:`1.5px solid ${unit.status===s?statusColor[s]:"rgba(255,255,255,0.1)"}`, background: unit.status===s?`${statusColor[s]}25`:"transparent", color: unit.status===s?statusColor[s]:"#4b5563", fontSize:10, fontWeight:700, cursor:"pointer" }}>
-                            {s==="In Stock"?"Stock":s}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div style={{ display:"flex", gap:8 }}>
-                      <div style={{ flex:1 }}>
-                        <div style={{ fontSize:10, color:"#6b7280", marginBottom:4 }}>🎯 GOAL</div>
-                        <div style={{ display:"flex", alignItems:"center", gap:4 }}>
-                          <span style={{ color:"#6b7280" }}>$</span>
-                          <input type="number" inputMode="decimal" value={unit.goalSellPrice} placeholder="0.00"
-                            onChange={e => updateUnit(detailLot.id, unit.id, { goalSellPrice:e.target.value })}
-                            style={{ ...inp, padding:"7px 10px", fontSize:14 }} />
-                        </div>
-                      </div>
-                      {unit.status === "Sold" && (
-                        <div style={{ flex:1 }}>
-                          <div style={{ fontSize:10, color:"#22c55e", marginBottom:4 }}>✅ SOLD FOR</div>
-                          <div style={{ display:"flex", alignItems:"center", gap:4 }}>
-                            <span style={{ color:"#6b7280" }}>$</span>
-                            <input type="number" inputMode="decimal" value={unit.actualSalePrice} placeholder="0.00"
-                              onChange={e => updateUnit(detailLot.id, unit.id, { actualSalePrice:e.target.value })}
-                              style={{ ...inp, padding:"7px 10px", fontSize:14 }} />
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    {unit.status==="Sold" && unitPayout!==null && unitProfit!==null && (
-                      <div style={{ marginTop:8, padding:"8px 10px", background:"rgba(255,255,255,0.04)", borderRadius:8, display:"flex", justifyContent:"space-between", fontSize:12 }}>
-                        <span style={{ color:"#9ca3af" }}>Payout after fees: <span style={{ color:"#22c55e", fontWeight:700 }}>{fmt(unitPayout)}</span></span>
-                        <span style={{ color:unitProfit>=0?"#22c55e":"#ef4444", fontWeight:700 }}>{unitProfit>=0?"+":""}{fmt(unitProfit)} vs cost</span>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              <div style={{ display:"flex", gap:8, marginTop:4 }}>
-                <button onClick={() => { setForm(detailLot); setEditLotId(detailLot.id); setView("add"); }}
-                  style={{ flex:1, padding:"12px 0", borderRadius:12, border:"1.5px solid #7c3aed", background:"transparent", color:"#a78bfa", fontWeight:700, fontSize:14, cursor:"pointer" }}>✏️ Edit</button>
-                <button onClick={() => deleteLot(detailLot.id)}
-                  style={{ flex:1, padding:"12px 0", borderRadius:12, border:"1.5px solid #ef4444", background:"transparent", color:"#f87171", fontWeight:700, fontSize:14, cursor:"pointer" }}>🗑️ Delete</button>
-              </div>
-            </div>
-          );
-        })()}
-
-        {/* ══════════════════════════════════════
-            ADD / EDIT
-        ══════════════════════════════════════ */}
-        {view === "add" && (
-          <div>
-            <h2 style={{ margin:"0 0 16px", fontSize:18, fontWeight:800 }}>{editLotId?"✏️ Edit Purchase":"➕ Add Tonie Purchase"}</h2>
-            <Field label="Lot / Purchase Name *">
-              <input style={inp} value={form.name} placeholder="e.g. Mixed Lot, Peppa Pig" onChange={e => setForm(f=>({...f,name:e.target.value}))} />
-              <div style={{ fontSize:11, color:"#6b7280", marginTop:5 }}>For mixed lots, you can rename each unit individually after saving</div>
-            </Field>
-            <Field label="Condition">
-              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                {CONDITIONS.map(c=><button key={c} onClick={()=>setForm(f=>({...f,condition:c}))} style={pill(form.condition===c)}>{c}</button>)}
-              </div>
-            </Field>
-            <Field label="Where You Bought It">
-              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                {SOURCES.map(s=><button key={s} onClick={()=>setForm(f=>({...f,source:s}))} style={pill(form.source===s)}>{s}</button>)}
-              </div>
-            </Field>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-              <Field label="Total Cost Paid *">
-                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                  <span style={{ color:"#6b7280", fontWeight:700 }}>$</span>
-                  <input style={inp} type="number" inputMode="decimal" value={form.totalCostPaid} placeholder="0.00" onChange={e=>setForm(f=>({...f,totalCostPaid:e.target.value}))} />
-                </div>
-              </Field>
-              <Field label="Inbound Shipping">
-                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                  <span style={{ color:"#6b7280", fontWeight:700 }}>$</span>
-                  <input style={inp} type="number" inputMode="decimal" value={form.inboundShipping} placeholder="0.00" onChange={e=>setForm(f=>({...f,inboundShipping:e.target.value}))} />
-                </div>
-              </Field>
-            </div>
-            <Field label="How Many Tonies?">
-              <input style={inp} type="number" inputMode="numeric" value={form.quantity} placeholder="1" onChange={e=>setForm(f=>({...f,quantity:e.target.value}))} />
-            </Field>
-            {totalCost > 0 && qty > 0 && (
-              <div style={{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:12, padding:"12px 14px", marginBottom:14 }}>
-                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                  <div><div style={{ fontSize:10, color:"#6b7280", textTransform:"uppercase", marginBottom:3 }}>Total you paid</div><div style={{ fontWeight:800 }}>{fmt(totalCost)}</div></div>
-                  <div><div style={{ fontSize:10, color:"#6b7280", textTransform:"uppercase", marginBottom:3 }}>Cost per unit</div><div style={{ fontWeight:800 }}>{fmt(perUnitCost)}</div></div>
-                </div>
-              </div>
-            )}
-            {breakEven && (
-              <div style={{ background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.25)", borderRadius:12, padding:"12px 14px", marginBottom:14 }}>
-                <div style={{ fontSize:11, color:"#fbbf24", fontWeight:700, textTransform:"uppercase", letterSpacing:0.8, marginBottom:2 }}>⚠️ Min Sell Price Per Unit</div>
-                <div style={{ fontSize:28, fontWeight:900, color:"#fbbf24" }}>{fmt(breakEven)}</div>
-                <div style={{ fontSize:11, color:"#92400e", marginTop:2 }}>Sell below this = a loss after Whatnot fees</div>
-              </div>
-            )}
-            <Field label="🎯 Goal Sell Price (per unit)">
-              <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                <span style={{ color:"#6b7280", fontWeight:700 }}>$</span>
-                <input style={inp} type="number" inputMode="decimal" value={form.goalSellPrice} placeholder="0.00" onChange={e=>setForm(f=>({...f,goalSellPrice:e.target.value}))} />
-              </div>
-              {goalProfit !== null && breakEven && (
-                <div style={{ marginTop:8, padding:"10px 12px", borderRadius:10, background: goalProfit>=0?"rgba(34,197,94,0.08)":"rgba(239,68,68,0.08)", border:`1px solid ${goalProfit>=0?"rgba(34,197,94,0.2)":"rgba(239,68,68,0.2)"}` }}>
-                  {goalProfit >= 0 ? (<>
-                    <div style={{ fontSize:13, color:"#22c55e", fontWeight:700 }}>✅ Profit per unit: {fmt(goalProfit)}</div>
-                    <div style={{ fontSize:12, color:"#4ade80", marginTop:3 }}>If all {qty} sell at goal: {fmt(calcPayout(parseFloat(form.goalSellPrice))*qty - totalCost)} total profit</div>
-                  </>) : (
-                    <div style={{ fontSize:13, color:"#ef4444", fontWeight:700 }}>⚠️ Below break-even — you'll lose money!</div>
-                  )}
-                </div>
-              )}
-            </Field>
-            <Field label="Notes (optional)">
-              <textarea style={{ ...inp, minHeight:60, resize:"vertical" }} value={form.notes} placeholder="Any notes..." onChange={e=>setForm(f=>({...f,notes:e.target.value}))} />
-            </Field>
-            <button onClick={saveLot} disabled={!form.name||!form.totalCostPaid} style={{
-              width:"100%", padding:"14px 0", borderRadius:13, border:"none",
-              background: form.name&&form.totalCostPaid?"linear-gradient(135deg,#7c3aed,#a855f7)":"rgba(255,255,255,0.08)",
-              color: form.name&&form.totalCostPaid?"#fff":"#4b5563",
-              fontWeight:800, fontSize:16, cursor: form.name&&form.totalCostPaid?"pointer":"not-allowed", marginTop:4,
-            }}>
-              {editLotId?"Save Changes":`Add ${qty>1?qty+" Tonies":"Tonie"} to Inventory`}
-            </button>
-          </div>
-        )}
+  return <div style={styles.page}>
+    <style>{css}</style>
+    <header style={styles.header}>
+      <div style={{ fontSize: 31 }}>🧸</div>
+      <h1 style={styles.title}>Dahlia's Tonie Tracker</h1>
+      <div style={styles.sub}>with love, Levy Yitschock 💕</div>
+      <div style={styles.syncBar}>
+        <span style={{ ...styles.syncBadge, color: syncStatus === "error" ? "#f87171" : syncStatus === "success" ? "#22c55e" : "#93c5fd" }}>{syncText}</span>
+        {settings.scriptUrl && <><button style={styles.smallBtn} onClick={doSync}>↑ Push</button><button style={styles.smallBtn} onClick={pullFromSheets}>↓ Pull</button></>}
+        <button style={styles.gear} onClick={() => setView("settings")}>⚙️</button>
       </div>
+      {message && <div style={styles.toast}>{message}</div>}
+    </header>
 
-      {/* ── BOTTOM NAV ── */}
-      <div style={{ position:"fixed", bottom:0, left:0, right:0, background:"rgba(13,11,30,0.95)", backdropFilter:"blur(12px)", borderTop:"1px solid rgba(255,255,255,0.07)", display:"flex", padding:"8px 0 12px" }}>
-        {[["dashboard","📊","Dashboard"],["inventory","📦","Inventory"],["add","➕","Add"],["settings","⚙️","Settings"]].map(([v,icon,lbl]) => (
-          <button key={v} onClick={() => { setView(v); if(v==="add"){setForm(EMPTY_FORM);setEditLotId(null);} }}
-            style={{ flex:1, background:"none", border:"none", cursor:"pointer", color: view===v?"#a78bfa":"#4b5563", display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
-            <span style={{ fontSize:18 }}>{icon}</span>
-            <span style={{ fontSize:10, fontWeight:700 }}>{lbl}</span>
-          </button>
-        ))}
+    <main style={styles.container}>
+      {view === "dashboard" && <Dashboard stats={stats} lots={lots} setView={setView} editLot={editLot} />}
+      {view === "inventory" && <Inventory lots={lots} filteredUnits={filteredUnits} filterStatus={filterStatus} setFilterStatus={setFilterStatus} updateUnit={updateUnit} deleteUnit={deleteUnit} editLot={editLot} />}
+      {view === "add" && <AddForm form={form} setForm={setForm} saveLot={saveLot} editLotId={editLotId} setEditLotId={setEditLotId} setView={setView} totalCost={totalCost} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} formQty={formQty} />}
+      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doSync={doSync} pullFromSheets={pullFromSheets} syncStatus={syncStatus} setLots={setLots} setView={setView} />}
+    </main>
+
+    <nav style={styles.nav}>
+      {[["dashboard","📊","Dashboard"],["inventory","📦","Inventory"],["add","➕","Add"],["settings","⚙️","Settings"]].map(([v, icon, label]) => <button key={v} onClick={() => { if (v === "add") { setForm(EMPTY_FORM); setEditLotId(null); } setView(v); }} style={{ ...styles.navBtn, color: view === v ? "#c4b5fd" : "#6b7280" }}><span style={{ fontSize: 20 }}>{icon}</span><span>{label}</span></button>)}
+    </nav>
+  </div>;
+}
+
+function Dashboard({ stats, lots, setView, editLot }: any) {
+  return <>
+    {lots.length === 0 ? <div style={{ ...styles.card, textAlign: "center", padding: 36 }}><div style={{ fontSize: 46 }}>📦</div><p style={{ color: "#9ca3af" }}>No Tonies yet — add your first purchase.</p><button style={styles.primaryBtn} onClick={() => setView("add")}>+ Add Tonie</button></div> : <>
+      <div className="statsGrid">
+        <StatCard title="Total Invested" value={money(stats.totalInvested)} tone="#fbbf24" />
+        <StatCard title="Units" value={`${stats.totalUnits}`} sub={`${stats.inStockUnits} open · ${stats.soldUnits} sold`} tone="#a78bfa" />
+        <StatCard title="Profit in Pocket" value={money(stats.realizedProfit)} tone={stats.realizedProfit >= 0 ? "#22c55e" : "#ef4444"} />
+        <StatCard title="Potential Profit" value={money(stats.projectedProfit)} tone="#60a5fa" />
       </div>
-    </div>
-  );
+      <h3 style={styles.sectionTitle}>Lots</h3>
+      <div className="lotGrid">{lots.map((lot: Lot) => <div key={String(lot.id)} style={styles.card}><div style={styles.rowBetween}><div><b>{lot.name}</b><div style={styles.muted}>{lot.units.length} units · {lot.condition} · {lot.source}</div></div><button style={styles.tinyBtn} onClick={() => editLot(lot)}>Edit Lot</button></div><div style={styles.miniGrid}><Mini label="Product" value={money(lotProductCost(lot))}/><Mini label="Shipping" value={money(lotShipping(lot))}/><Mini label="Unit Cost" value={money(totalCostPerUnit(lot))}/><Mini label="Break Even" value={money(calcBreakEven(totalCostPerUnit(lot)))}/></div></div>)}</div>
+    </>}
+  </>;
 }
 
-function Stat({ label, value, unit, color="#f0eeff", big }) {
-  return (
-    <div>
-      <div style={{ fontSize:10, color:"#6b7280", textTransform:"uppercase", letterSpacing:0.6, marginBottom:3 }}>{label}</div>
-      <div style={{ fontSize:big?19:24, fontWeight:900, color }}>{value}{unit&&<span style={{ fontSize:12, fontWeight:500, color:"#6b7280", marginLeft:3 }}>{unit}</span>}</div>
-    </div>
-  );
+function Inventory({ lots, filteredUnits, filterStatus, setFilterStatus, updateUnit, deleteUnit, editLot }: any) {
+  return <>
+    <div style={styles.filterBar}>{["All", "In Stock", "Listed", "Sold"].map(s => <button key={s} onClick={() => setFilterStatus(s)} style={{ ...styles.pill, borderColor: filterStatus === s ? (statusColor[s] || "#a78bfa") : "rgba(255,255,255,.12)", color: filterStatus === s ? "#fff" : "#9ca3af", background: filterStatus === s ? `${statusColor[s] || "#7c3aed"}33` : "transparent" }}>{s}</button>)}</div>
+    {filteredUnits.length === 0 ? <div style={{ ...styles.card, textAlign: "center", color: "#9ca3af" }}>No units here.</div> : <div className="unitGrid">{filteredUnits.map(({ lot, unit, productUnit, shipUnit, unitCost, breakEven }: any) => {
+      const payout = unit.actualSalePrice ? calcPayout(unit.actualSalePrice) : null;
+      const profit = payout !== null ? payout - unitCost : null;
+      return <div key={`${lot.id}_${unit.id}`} style={styles.unitCard}>
+        <div style={styles.rowBetween}><div><b>{unit.name}</b><div style={styles.muted}>Lot: {lot.name}</div></div><span style={{ ...styles.status, color: statusColor[unit.status] }}>{unit.status}</span></div>
+        <div style={styles.miniGrid}><Mini label="Product/Unit" value={money(productUnit)} /><Mini label="Ship/Unit" value={money(shipUnit)} /><Mini label="Cost/Unit" value={money(unitCost)} /><Mini label="Break Even" value={money(breakEven)} /></div>
+        <div className="unitControls">
+          <label>Status<select value={unit.status} onChange={e => updateUnit(lot.id, unit.id, { status: e.target.value })} style={styles.input}>{STATUSES.map(s => <option key={s}>{s}</option>)}</select></label>
+          <label>Goal $<input value={unit.goalSellPrice || ""} onChange={e => updateUnit(lot.id, unit.id, { goalSellPrice: e.target.value })} style={styles.input} inputMode="decimal" /></label>
+          <label>Sold $<input value={unit.actualSalePrice || ""} onChange={e => updateUnit(lot.id, unit.id, { actualSalePrice: e.target.value, status: e.target.value ? "Sold" : unit.status })} style={styles.input} inputMode="decimal" /></label>
+        </div>
+        {profit !== null && <div style={{ ...styles.result, color: profit >= 0 ? "#22c55e" : "#ef4444" }}>Payout {money(payout!)} · Profit {money(profit)}</div>}
+        <div style={{ display:"flex", gap:8, marginTop:10 }}><button style={styles.tinyBtn} onClick={() => editLot(lot)}>Edit Lot</button><button style={{ ...styles.tinyBtn, borderColor:"#ef4444", color:"#f87171" }} onClick={() => { if (confirm("Delete this unit?")) deleteUnit(lot.id, unit.id); }}>Delete Unit</button></div>
+      </div>;
+    })}</div>}
+  </>;
 }
-function MiniStat({ label, value, color="#f0eeff" }) {
-  return (
-    <div style={{ background:"rgba(255,255,255,0.04)", borderRadius:8, padding:"8px 10px" }}>
-      <div style={{ fontSize:10, color:"#6b7280", marginBottom:2 }}>{label}</div>
-      <div style={{ fontSize:13, fontWeight:800, color }}>{value}</div>
-    </div>
-  );
+
+function AddForm({ form, setForm, saveLot, editLotId, setEditLotId, setView, totalCost, formProductUnit, formShipUnit, formUnitCost, formBreakEven, formQty }: any) {
+  return <div className="formWrap">
+    <h2 style={styles.h2}>{editLotId ? "Edit Purchase Lot" : "Add Purchase Lot"}</h2>
+    <Field label="Lot / Purchase Name"><input style={styles.input} value={form.name} onChange={e => setForm((f: any) => ({ ...f, name: e.target.value }))} placeholder="e.g. eBay Tonies Lot" /></Field>
+    <div className="twoCols"><Field label="Condition"><select style={styles.input} value={form.condition} onChange={e => setForm((f: any) => ({ ...f, condition: e.target.value }))}>{CONDITIONS.map(c => <option key={c}>{c}</option>)}</select></Field><Field label="Source"><select style={styles.input} value={form.source} onChange={e => setForm((f: any) => ({ ...f, source: e.target.value }))}>{SOURCES.map(s => <option key={s}>{s}</option>)}</select></Field></div>
+    <div className="twoCols"><Field label="Product Cost Total"><input style={styles.input} value={form.totalCostPaid} onChange={e => setForm((f: any) => ({ ...f, totalCostPaid: e.target.value }))} inputMode="decimal" placeholder="150" /></Field><Field label="Shipping Total"><input style={styles.input} value={form.inboundShipping} onChange={e => setForm((f: any) => ({ ...f, inboundShipping: e.target.value }))} inputMode="decimal" placeholder="25" /></Field></div>
+    <div className="twoCols"><Field label="How Many Units"><input style={styles.input} value={form.quantity} onChange={e => setForm((f: any) => ({ ...f, quantity: e.target.value }))} inputMode="numeric" /></Field><Field label="Goal Sell Price / Unit"><input style={styles.input} value={form.goalSellPrice} onChange={e => setForm((f: any) => ({ ...f, goalSellPrice: e.target.value }))} inputMode="decimal" /></Field></div>
+    <div style={styles.card}><div style={styles.miniGrid}><Mini label="Product / Unit" value={money(formProductUnit)} /><Mini label="Shipping / Unit" value={money(formShipUnit)} /><Mini label="Total / Unit" value={money(formUnitCost)} /><Mini label="Break Even" value={formBreakEven ? money(formBreakEven) : "—"} /></div><div style={{ ...styles.muted, marginTop: 10 }}>Example: $150 product + $25 shipping ÷ {formQty} units = {money(formUnitCost)} per unit.</div></div>
+    <Field label="Notes"><textarea style={{ ...styles.input, minHeight: 70 }} value={form.notes} onChange={e => setForm((f: any) => ({ ...f, notes: e.target.value }))} /></Field>
+    <button style={styles.primaryBtn} onClick={saveLot} disabled={!form.name || !form.totalCostPaid}>{editLotId ? "Save Changes" : "Add to Inventory"}</button>
+    {editLotId && <button style={styles.secondaryBtn} onClick={() => { setEditLotId(null); setView("inventory"); }}>Cancel</button>}
+  </div>;
 }
-function Row({ label, value, color="#f0eeff" }) {
-  return (
-    <div style={{ display:"flex", justifyContent:"space-between", padding:"6px 0", fontSize:14 }}>
-      <span style={{ color:"#9ca3af" }}>{label}</span>
-      <span style={{ fontWeight:700, color }}>{value}</span>
-    </div>
-  );
+
+function SettingsView({ settings, setSettings, doSync, pullFromSheets, syncStatus, setLots, setView }: any) {
+  return <div className="formWrap"><button style={styles.linkBtn} onClick={() => setView("dashboard")}>← Back</button><h2 style={styles.h2}>Settings</h2><div style={styles.card}><h3 style={styles.sectionTitle}>Google Sheets Sync</h3><p style={styles.muted}>This app now has your Google Apps Script URL built in. Every device will connect to the same Google Sheet automatically. Keep the script below in your Google Apps Script deployment.</p><textarea readOnly style={{ ...styles.input, minHeight: 260, fontFamily: "monospace", fontSize: 12 }} value={APPS_SCRIPT_CODE} onFocus={(e) => e.currentTarget.select()} />
+    <Field label="Google Apps Script Web App URL"><input style={styles.input} value={DEFAULT_SCRIPT_URL} readOnly /></Field>
+    <Field label="Sync Mode"><select style={styles.input} value={settings.syncMode} onChange={e => setSettings((s: Settings) => ({ ...s, syncMode: e.target.value }))}><option value="manual">Manual</option><option value="auto">Auto pull on open + auto push after edits</option><option value="export">Export/Import only</option></select></Field>
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}><button style={styles.primaryBtn} onClick={doSync}>{syncStatus === "syncing" ? "Working..." : "Push to Sheets"}</button><button style={styles.secondaryBtn} onClick={pullFromSheets}>Pull from Sheets</button></div><div style={{ ...styles.muted, marginTop: 8 }}>Last synced: {dateText(settings.lastSynced)}</div></div>
+    <div style={{ ...styles.card, borderColor: "rgba(239,68,68,.35)" }}><h3 style={{ ...styles.sectionTitle, color: "#f87171" }}>Danger Zone</h3><button style={{ ...styles.secondaryBtn, color: "#f87171", borderColor: "#ef4444" }} onClick={() => { if (confirm("Delete all local inventory data?")) setLots([]); }}>Clear Local Data</button></div></div>;
 }
-function Field({ label, children }) {
-  return (
-    <div style={{ marginBottom:14 }}>
-      <label style={{ fontSize:11, fontWeight:700, color:"#a78bfa", textTransform:"uppercase", letterSpacing:0.8, display:"block", marginBottom:7 }}>{label}</label>
-      {children}
-    </div>
-  );
-}
+
+function StatCard({ title, value, sub, tone }: any) { return <div style={styles.card}><div style={styles.muted}>{title}</div><div style={{ fontSize: 24, fontWeight: 900, color: tone }}>{value}</div>{sub && <div style={styles.muted}>{sub}</div>}</div>; }
+function Mini({ label, value }: any) { return <div style={styles.mini}><div style={styles.miniLabel}>{label}</div><div style={styles.miniVal}>{value}</div></div>; }
+function Field({ label, children }: any) { return <label style={styles.field}><span>{label}</span>{children}</label>; }
+
+const styles: Record<string, any> = {
+  page: { minHeight: "100vh", background: "linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%)", color: "#f8f7ff", fontFamily: "Inter, system-ui, Segoe UI, sans-serif", paddingBottom: 86 },
+  header: { textAlign: "center", padding: "22px 14px 10px", position: "relative" }, title: { margin: 0, fontSize: 25, fontWeight: 900, background: "linear-gradient(90deg,#a78bfa,#f0abfc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }, sub: { fontSize: 12, color: "#c4b5fd", opacity: .7, fontStyle: "italic" },
+  syncBar: { display: "flex", gap: 8, alignItems: "center", justifyContent: "center", marginTop: 10, flexWrap: "wrap" }, syncBadge: { fontSize: 12, padding: "4px 10px", borderRadius: 9, background: "rgba(255,255,255,.06)", fontWeight: 700 }, smallBtn: { border: "1px solid rgba(255,255,255,.14)", background: "rgba(255,255,255,.06)", color: "#ddd6fe", borderRadius: 9, padding: "5px 10px", cursor: "pointer", fontWeight: 700 }, gear: { background: "none", border: 0, cursor: "pointer", fontSize: 18 }, toast: { position: "absolute", right: 16, top: 12, background: "rgba(34,197,94,.16)", color: "#86efac", padding: "6px 10px", borderRadius: 10, fontSize: 12, fontWeight: 800 },
+  container: { width: "min(1180px, calc(100% - 28px))", margin: "0 auto" }, card: { background: "rgba(255,255,255,.055)", border: "1px solid rgba(255,255,255,.10)", borderRadius: 16, padding: 16, marginBottom: 12, boxSizing: "border-box" },
+  primaryBtn: { border: 0, borderRadius: 12, padding: "12px 18px", background: "linear-gradient(135deg,#7c3aed,#a855f7)", color: "#fff", fontWeight: 850, cursor: "pointer" }, secondaryBtn: { border: "1.5px solid #7c3aed", borderRadius: 12, padding: "12px 18px", background: "transparent", color: "#c4b5fd", fontWeight: 800, cursor: "pointer" }, linkBtn: { background: "none", border: 0, color: "#c4b5fd", fontWeight: 800, cursor: "pointer", marginBottom: 8 }, tinyBtn: { border: "1px solid rgba(255,255,255,.18)", background: "rgba(255,255,255,.05)", color: "#ddd6fe", borderRadius: 9, padding: "7px 10px", cursor: "pointer", fontWeight: 700 },
+  input: { width: "100%", boxSizing: "border-box", background: "rgba(255,255,255,.075)", border: "1.5px solid rgba(255,255,255,.13)", borderRadius: 10, padding: "10px 12px", color: "#f8f7ff", fontSize: 15, outline: "none", fontFamily: "inherit" }, field: { display: "block", marginBottom: 14, color: "#a78bfa", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: .7 },
+  h2: { margin: "0 0 16px", fontSize: 20 }, sectionTitle: { margin: "0 0 12px", color: "#c4b5fd", fontSize: 14, textTransform: "uppercase", letterSpacing: .8 }, muted: { color: "#9ca3af", fontSize: 12, lineHeight: 1.5 }, rowBetween: { display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }, miniGrid: { display: "grid", gridTemplateColumns: "repeat(2,minmax(0,1fr))", gap: 8, marginTop: 12 }, mini: { background: "rgba(255,255,255,.045)", borderRadius: 10, padding: 10 }, miniLabel: { color: "#9ca3af", fontSize: 10, marginBottom: 3 }, miniVal: { fontWeight: 850, fontSize: 14 },
+  filterBar: { display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }, pill: { border: "1.5px solid rgba(255,255,255,.12)", borderRadius: 999, padding: "7px 13px", cursor: "pointer", fontWeight: 800 }, unitCard: { background: "rgba(255,255,255,.055)", border: "1px solid rgba(255,255,255,.10)", borderRadius: 16, padding: 14, boxSizing: "border-box" }, status: { fontSize: 12, fontWeight: 900 }, result: { marginTop: 10, background: "rgba(255,255,255,.05)", borderRadius: 10, padding: 9, fontSize: 13, fontWeight: 800 }, nav: { position: "fixed", bottom: 0, left: 0, right: 0, background: "rgba(13,11,30,.96)", backdropFilter: "blur(12px)", borderTop: "1px solid rgba(255,255,255,.08)", display: "flex", padding: "8px 0 12px", zIndex: 10 }, navBtn: { flex: 1, background: "none", border: 0, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 2, fontSize: 10, fontWeight: 800 }
+};
+
+const css = `
+.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.lotGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.unitGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.unitControls{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:12px}.unitControls label{font-size:10px;color:#9ca3af;text-transform:uppercase;font-weight:800;letter-spacing:.5px}.formWrap{max-width:760px;margin:0 auto}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}option{background:#0d0b1e;color:#fff}@media(max-width:980px){.statsGrid{grid-template-columns:repeat(2,1fr)}.unitGrid{grid-template-columns:repeat(2,1fr)}.lotGrid{grid-template-columns:1fr}}@media(max-width:640px){.unitGrid,.statsGrid,.twoCols{grid-template-columns:1fr}.unitControls{grid-template-columns:1fr}.lotGrid{grid-template-columns:1fr}}
+`;
