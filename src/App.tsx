@@ -4,14 +4,14 @@ import WhatnotCalculator from "./Calculator";
 const COMMISSION = 0.08;
 const PROC_PCT = 0.029;
 const PROC_FLAT = 0.30;
-const STORAGE_KEY = "dahlia_tonie_tracker_v10_units";
-const SETTINGS_KEY = "dahlia_tonie_settings_v10";
-const SESSION_PULL_KEY = "dahlia_tonie_session_pulled_v10";
+const STORAGE_KEY = "dahlia_tonie_tracker_v11_units";
+const SETTINGS_KEY = "dahlia_tonie_settings_v11";
+const SESSION_PULL_KEY = "dahlia_tonie_session_pulled_v11";
 const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdRd2MShDnHkGfHQxIbpp7Hbn6Zn-FDDEatNDNNOq6w8kmXECMNzJlXezB/exec";
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
 const STATUSES = ["In Stock", "Listed", "Sold"];
-const SCHEMA_VERSION = "10.0-safe-units";
+const SCHEMA_VERSION = "11.0-safe-edit";
 
 type Unit = {
   unitKey: string;
@@ -66,6 +66,8 @@ function pct(n: number | null | undefined) { if (n === null || n === undefined |
 function isoNow() { return new Date().toISOString(); }
 function dateMs(v: any) { const d = new Date(v || 0); return isNaN(d.getTime()) ? 0 : d.getTime(); }
 function displayDate(v: any) { if (!v) return "—"; const d = new Date(v); return isNaN(d.getTime()) ? "—" : d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit" }); }
+function inputDate(v: any) { if (!v) return ""; const d = new Date(v); return isNaN(d.getTime()) ? "" : d.toISOString().slice(0,10); }
+function isoFromDateInput(v: string) { if (!v) return ""; const d = new Date(v + "T12:00:00"); return isNaN(d.getTime()) ? "" : d.toISOString(); }
 function dateText(ts: number | null) { if (!ts) return "Never"; return new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
 function payoutFromSale(sale: any) { const sp = num(sale); if (!sp) return null; return sp - sp * COMMISSION - (sp * PROC_PCT + PROC_FLAT); }
 function breakEven(cost: number) { return (cost + PROC_FLAT) / (1 - COMMISSION - PROC_PCT); }
@@ -113,8 +115,8 @@ function normalizeUnit(raw: any): Unit {
     status: normalizeStatus(raw.status ?? raw["Status"]),
     actualSalePrice: String(raw.actualSalePrice ?? raw["Sold For"] ?? ""),
     notes: String(raw.notes ?? raw["Notes"] ?? ""),
-    dateAdded: String(raw.dateAdded ?? raw["Date Added"] ?? isoNow()),
-    soldAt: String(raw.soldAt ?? raw["Sold At"] ?? ""),
+    dateAdded: String(raw.dateAdded ?? raw["Date Purchased"] ?? raw["Date Added"] ?? isoNow()),
+    soldAt: String(raw.soldAt ?? raw["Date Sold"] ?? raw["Sold At"] ?? ""),
     updatedAt: String(raw.updatedAt ?? raw["Updated At"] ?? isoNow())
   };
 }
@@ -123,11 +125,12 @@ function loadInitialUnits(): Unit[] {
   try {
     const direct = localStorage.getItem(STORAGE_KEY);
     if (direct) return JSON.parse(direct).map(normalizeUnit);
-    const oldKeys = ["dahlia_tonie_tracker_v7", "dahlia_tonie_tracker_v6", "dahlia_tonie_tracker_v5", "dahlia_tonie_tracker_v4"];
+    const oldKeys = ["dahlia_tonie_tracker_v10_units", "dahlia_tonie_tracker_v7", "dahlia_tonie_tracker_v6", "dahlia_tonie_tracker_v5", "dahlia_tonie_tracker_v4"];
     for (const k of oldKeys) {
       const old = localStorage.getItem(k);
       if (!old) continue;
       const parsed = JSON.parse(old);
+      if (Array.isArray(parsed) && parsed[0] && !parsed[0]?.units) return parsed.map(normalizeUnit);
       if (Array.isArray(parsed) && parsed[0]?.units) {
         const flat: Unit[] = [];
         parsed.forEach((lot: any) => (lot.units || []).forEach((u: any) => flat.push(normalizeUnit({ ...lot, lotKey: lot.id, lotName: lot.name, ...u, unitKey: u.id, unitName: u.name, lotProductTotal: lot.productTotal, lotShippingTotal: lot.shippingTotal, condition: u.condition || lot.condition }))));
@@ -230,8 +233,8 @@ function rowsToUnits(rows: any[]): Unit[] {
     status: r["Status"] || r.status,
     actualSalePrice: r["Sold For"] || r.actualSalePrice,
     notes: r["Notes"] || r.notes,
-    dateAdded: r["Date Added"] || r.dateAdded,
-    soldAt: r["Sold At"] || r.soldAt,
+    dateAdded: r["Date Purchased"] || r["Date Added"] || r.dateAdded,
+    soldAt: r["Date Sold"] || r["Sold At"] || r.soldAt,
     updatedAt: r["Updated At"] || r.updatedAt,
     _idx: idx
   }));
@@ -242,7 +245,7 @@ function rowsToUnits(rows: any[]): Unit[] {
   });
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '10.0-safe-units';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '11.0-safe-edit';
 
 function doPost(e) {
   try {
@@ -291,14 +294,14 @@ function writeInventory_(ss, rows) {
   var sheet = ss.getSheetByName('Inventory') || ss.insertSheet('Inventory');
   sheet.clearContents();
   sheet.clearFormats();
-  sheet.showColumns(1, 25);
+  sheet.showColumns(1, 26);
 
   var headers = [
     'Internal Unit Key','Internal Lot Key','Schema Version',
-    'Lot Name','Unit Name','Category','Condition','Source','Seller','Units In Lot',
+    'Lot Name','Unit Name','Category','Condition','Source','Seller','Qty in Lot',
     'Lot Product Total Raw','Lot Shipping Total Raw',
     'Product Cost / Unit','Shipping / Unit','Total Cost / Unit','Break Even',
-    'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Added','Sold At','Updated At','Synced At'
+    'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Purchased','Date Sold','Updated At','Synced At'
   ];
   sheet.appendRow(headers);
 
@@ -373,6 +376,7 @@ export default function App() {
     catch { return { syncMode: "auto", lastSynced: null, firstPullDone: false }; }
   });
   const [view, setView] = useState("dashboard");
+  const [editUnitKey, setEditUnitKey] = useState<string | null>(null);
   const [form, setForm] = useState<AddForm>(EMPTY_FORM);
   const [filterStatus, setFilterStatus] = useState("All");
   const [filterCategory, setFilterCategory] = useState("All");
@@ -522,13 +526,17 @@ export default function App() {
     setUnits(prev => prev.filter(u => u.unitKey !== unitKey));
   }
 
-  function setQuantityDraft(qtyNum: number) {
+  function setQuantityDraft(rawQty: any) {
     setForm(f => {
-      const qty = Math.max(1, qtyNum || 1);
+      const raw = String(rawQty ?? "");
+      if (raw === "") return { ...f, quantity: "" };
+      const parsed = parseInt(raw, 10);
+      if (!Number.isFinite(parsed) || parsed < 1) return { ...f, quantity: raw };
+      const qty = parsed;
       let drafts = [...f.unitDrafts];
       while (drafts.length < qty) drafts.push({ unitName: `${f.lotName || "Tonie"} #${drafts.length + 1}`, category: f.category, condition: f.condition, goalSellPrice: f.goalSellPrice, notes: "" });
       if (drafts.length > qty) drafts = drafts.slice(0, qty);
-      return { ...f, quantity: String(qty), unitDrafts: drafts };
+      return { ...f, quantity: raw, unitDrafts: drafts };
     });
   }
 
@@ -572,13 +580,14 @@ export default function App() {
     <header className="header">
       <div className="bear">🧸</div>
       <h1>Dahlia's Tonie Tracker</h1>
-      <div className="sub">safe sync edition • Sheets as database</div>
+      <div className="sub">safe edit edition • Sheets as database</div>
       <div className="syncBar"><span className={`syncBadge ${syncStatus}`}>{syncText}</span></div>
       {message && <div className="toast">{message}</div>}
     </header>
     <main className="container">
       {view === "dashboard" && <Dashboard stats={stats} units={enriched} dashRange={dashRange} setDashRange={setDashRange} setFilterStatus={setFilterStatus} setView={setView} />}
-      {view === "inventory" && <Inventory units={filtered} setView={setView} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} search={search} setSearch={setSearch} filterStatus={filterStatus} setFilterStatus={setFilterStatus} filterCategory={filterCategory} setFilterCategory={setFilterCategory} filterCondition={filterCondition} setFilterCondition={setFilterCondition} filterSource={filterSource} setFilterSource={setFilterSource} filterSeller={filterSeller} setFilterSeller={setFilterSeller} categories={categories} conditions={conditions} sources={sources} sellers={sellers} sortBy={sortBy} setSortBy={setSortBy} />}
+      {view === "inventory" && <Inventory units={filtered} setView={setView} setEditUnitKey={setEditUnitKey} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} search={search} setSearch={setSearch} filterStatus={filterStatus} setFilterStatus={setFilterStatus} filterCategory={filterCategory} setFilterCategory={setFilterCategory} filterCondition={filterCondition} setFilterCondition={setFilterCondition} filterSource={filterSource} setFilterSource={setFilterSource} filterSeller={filterSeller} setFilterSeller={setFilterSeller} categories={categories} conditions={conditions} sources={sources} sellers={sellers} sortBy={sortBy} setSortBy={setSortBy} />}
+      {view === "edit" && <EditUnitView unit={enriched.find(u => u.unitKey === editUnitKey)} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} setView={setView} />}
       {view === "add" && <AddFormView form={form} setForm={setForm} setQuantityDraft={setQuantityDraft} saveNew={saveNew} formQty={formQty} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} expectedProfit={expectedProfit} expectedRoi={expectedRoi} />}
       {view === "calculator" && <WhatnotCalculator />}
       {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} />}
@@ -620,7 +629,7 @@ function Dashboard({ stats, units, dashRange, setDashRange, setFilterStatus, set
 }
 
 function Inventory(props: any) {
-  const { units, updateUnit, updateLotShared, deleteUnit, search, setSearch, filterStatus, setFilterStatus, filterCategory, setFilterCategory, filterCondition, setFilterCondition, filterSource, setFilterSource, filterSeller, setFilterSeller, categories, conditions, sources, sellers, sortBy, setSortBy } = props;
+  const { units, setView, setEditUnitKey, updateUnit, updateLotShared, deleteUnit, search, setSearch, filterStatus, setFilterStatus, filterCategory, setFilterCategory, filterCondition, setFilterCondition, filterSource, setFilterSource, filterSeller, setFilterSeller, categories, conditions, sources, sellers, sortBy, setSortBy } = props;
   return <>
     <div className="toolbar advanced">
       <input className="search" placeholder="Search unit, lot, seller, source..." value={search} onChange={e => setSearch(e.target.value)} />
@@ -631,9 +640,12 @@ function Inventory(props: any) {
       <select value={filterSeller} onChange={e => setFilterSeller(e.target.value)}><option>All</option>{sellers.map((x:string) => <option key={x}>{x}</option>)}</select>
       <select value={sortBy} onChange={e => setSortBy(e.target.value)}><option value="date-desc">Newest first</option><option value="date-asc">Oldest first</option><option value="name">Name</option><option value="category">Category</option><option value="seller">Seller</option></select>
     </div>
+    <div className="countLine">Showing <b>{units.length}</b> items</div>
     <div className="sheetWrap"><table className="inventoryTable"><thead><tr>
-      <th>Lot Name</th><th>Unit Name</th><th>Category</th><th>Condition</th><th>Source</th><th>Seller</th><th>Qty</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal</th><th>Status</th><th>Sold For</th><th>Payout</th><th>Profit</th><th>Notes</th><th>Date</th><th></th>
-    </tr></thead><tbody>{units.map((u: FlatCalc) => <tr key={u.unitKey}>
+      <th>#</th><th>Edit</th><th>Lot Name</th><th>Unit Name</th><th>Category</th><th>Condition</th><th>Source</th><th>Seller</th><th>Qty in Lot</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal</th><th>Projected Profit</th><th>Status</th><th>Sold For</th><th>Payout</th><th>Actual Profit</th><th>Notes</th><th>Date Purchased</th><th>Date Sold</th>
+    </tr></thead><tbody>{units.map((u: FlatCalc, idx: number) => { const projectedPayout = payoutFromSale(u.goalSellPrice); const projectedProfit = projectedPayout === null ? null : projectedPayout - u.totalUnit; return <tr key={u.unitKey}>
+      <td className="rowNum">{idx + 1}</td>
+      <td><button className="editSmall" onClick={() => { setEditUnitKey(u.unitKey); setView("edit"); }}>Edit</button></td>
       <td><input value={u.lotName} onChange={e => updateLotShared(u.lotKey, { lotName: e.target.value })} /></td>
       <td><input value={u.unitName} onChange={e => updateUnit(u.unitKey, { unitName: e.target.value })} /></td>
       <td><input value={u.category} onChange={e => updateUnit(u.unitKey, { category: e.target.value })} /></td>
@@ -642,14 +654,40 @@ function Inventory(props: any) {
       <td><input value={u.seller} onChange={e => updateLotShared(u.lotKey, { seller: e.target.value })} /></td>
       <td>{u.lotQty}</td><td>{money(u.productUnit)}</td><td>{money(u.shippingUnit)}</td><td>{money(u.totalUnit)}</td><td>{money(u.breakEven)}</td>
       <td><input value={u.goalSellPrice} inputMode="decimal" onChange={e => updateUnit(u.unitKey, { goalSellPrice: e.target.value })} /></td>
+      <td className={projectedProfit === null ? "" : projectedProfit >= 0 ? "green" : "red"}>{money(projectedProfit)}</td>
       <td><select value={u.status} onChange={e => updateUnit(u.unitKey, { status: e.target.value })}>{STATUSES.map(x => <option key={x}>{x}</option>)}</select></td>
       <td><input value={u.actualSalePrice} inputMode="decimal" onChange={e => updateUnit(u.unitKey, { actualSalePrice: e.target.value })} /></td>
       <td>{money(u.payout)}</td><td className={u.profit === null ? "" : u.profit >= 0 ? "green" : "red"}>{money(u.profit)}</td>
       <td><input value={u.notes} onChange={e => updateUnit(u.unitKey, { notes: e.target.value })} /></td>
-      <td>{displayDate(u.dateAdded)}</td><td><button className="dangerSmall" onClick={() => deleteUnit(u.unitKey)}>Delete</button></td>
-    </tr>)}</tbody></table></div>
+      <td><input type="date" value={inputDate(u.dateAdded)} onChange={e => updateUnit(u.unitKey, { dateAdded: isoFromDateInput(e.target.value) })} /></td>
+      <td><input type="date" value={inputDate(u.soldAt)} onChange={e => updateUnit(u.unitKey, { soldAt: isoFromDateInput(e.target.value), status: e.target.value ? "Sold" : u.status })} /></td>
+    </tr>})}</tbody></table></div>
     {!units.length && <div className="empty"><div>📦</div><h3>No inventory found</h3><p>Try clearing filters or adding inventory.</p></div>}
   </>;
+}
+
+
+function EditUnitView({ unit, updateUnit, updateLotShared, deleteUnit, setView }: any) {
+  if (!unit) return <div className="formWrap"><div className="panel"><h2>Item not found</h2><button className="primary" onClick={() => setView("inventory")}>Back to Inventory</button></div></div>;
+  const projectedPayout = payoutFromSale(unit.goalSellPrice);
+  const projectedProfit = projectedPayout === null ? null : projectedPayout - unit.totalUnit;
+  const projectedRoi = projectedProfit !== null && unit.totalUnit ? (projectedProfit / unit.totalUnit) * 100 : null;
+  return <div className="formWrap">
+    <h2>✏️ Edit Item</h2>
+    <p className="formSub">Full edit page for pricing, purchase dates, sale dates, lot info, and deleting one unit from a lot.</p>
+    <div className="flashyForm">
+      <div className="twoCols"><Field label="🧺 Lot Name"><input value={unit.lotName} onChange={e => updateLotShared(unit.lotKey, { lotName: e.target.value })} /></Field><Field label="🎵 Unit Name"><input value={unit.unitName} onChange={e => updateUnit(unit.unitKey, { unitName: e.target.value })} /></Field></div>
+      <div className="twoCols"><Field label="🏷️ Source"><input value={unit.source} onChange={e => updateLotShared(unit.lotKey, { source: e.target.value })} /></Field><Field label="🧑‍💼 Seller"><input value={unit.seller} onChange={e => updateLotShared(unit.lotKey, { seller: e.target.value })} /></Field></div>
+      <div className="twoCols"><Field label="🗂️ Category"><input value={unit.category} onChange={e => updateUnit(unit.unitKey, { category: e.target.value })} /></Field><Field label="✨ Condition"><select value={unit.condition} onChange={e => updateUnit(unit.unitKey, { condition: e.target.value })}>{CONDITIONS.map(x => <option key={x}>{x}</option>)}</select></Field></div>
+      <div className="twoCols"><Field label="💵 Lot Product Total"><input value={unit.lotProductTotal} inputMode="decimal" onChange={e => updateLotShared(unit.lotKey, { lotProductTotal: e.target.value })} /></Field><Field label="🚚 Lot Shipping Total"><input value={unit.lotShippingTotal} inputMode="decimal" onChange={e => updateLotShared(unit.lotKey, { lotShippingTotal: e.target.value })} /></Field></div>
+      <div className="calcBox"><div className="miniGrid"><Mini label="Qty in Lot" value={unit.lotQty} /><Mini label="Product / Unit" value={money(unit.productUnit)} /><Mini label="Shipping / Unit" value={money(unit.shippingUnit)} /><Mini label="Cost / Unit" value={money(unit.totalUnit)} /><Mini label="Break Even" value={money(unit.breakEven)} /><Mini label="Projected Profit" value={money(projectedProfit)} /><Mini label="Projected ROI" value={pct(projectedRoi)} /></div></div>
+      <div className="twoCols"><Field label="🎯 Goal Price"><input value={unit.goalSellPrice} inputMode="decimal" onChange={e => updateUnit(unit.unitKey, { goalSellPrice: e.target.value })} /></Field><Field label="📌 Status"><select value={unit.status} onChange={e => updateUnit(unit.unitKey, { status: e.target.value })}>{STATUSES.map(x => <option key={x}>{x}</option>)}</select></Field></div>
+      <div className="twoCols"><Field label="💰 Sold For"><input value={unit.actualSalePrice} inputMode="decimal" onChange={e => updateUnit(unit.unitKey, { actualSalePrice: e.target.value })} /></Field><Field label="Actual Profit"><input value={money(unit.profit)} readOnly /></Field></div>
+      <div className="twoCols"><Field label="📅 Date Purchased"><input type="date" value={inputDate(unit.dateAdded)} onChange={e => updateUnit(unit.unitKey, { dateAdded: isoFromDateInput(e.target.value) })} /></Field><Field label="✅ Date Sold"><input type="date" value={inputDate(unit.soldAt)} onChange={e => updateUnit(unit.unitKey, { soldAt: isoFromDateInput(e.target.value), status: e.target.value ? "Sold" : unit.status })} /></Field></div>
+      <Field label="📝 Notes"><textarea value={unit.notes} onChange={e => updateUnit(unit.unitKey, { notes: e.target.value })} /></Field>
+      <div className="buttonRow"><button className="primary" onClick={() => setView("inventory")}>Done</button><button className="secondary danger" onClick={() => { deleteUnit(unit.unitKey); setView("inventory"); }}>Delete this unit</button></div>
+    </div>
+  </div>;
 }
 
 function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formProductUnit, formShipUnit, formUnitCost, formBreakEven, expectedProfit, expectedRoi }: any) {
@@ -660,7 +698,7 @@ function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formPr
     <div className="flashyForm">
       <div className="toggleRow"><button className={!form.lotMode ? "pill active" : "pill"} onClick={() => setForm((f: AddForm) => ({ ...f, lotMode: false, quantity: "1" }))}>Single item</button><button className={form.lotMode ? "pill active" : "pill"} onClick={() => { setForm((f: AddForm) => ({ ...f, lotMode: true })); setQuantityDraft(parseInt(form.quantity) || 2); }}>Lot builder</button></div>
       <div className="twoCols"><Field label="🧺 Lot Name"><input value={form.lotName} onChange={e => setForm((f: AddForm) => ({ ...f, lotName: e.target.value }))} placeholder="e.g. Whatnot 6/23 Lot" /></Field><Field label="🏷️ Source"><input value={form.source} onChange={e => setForm((f: AddForm) => ({ ...f, source: e.target.value }))} placeholder="Whatnot, eBay, Facebook..." /></Field></div>
-      <div className="twoCols"><Field label="🧑‍💼 Seller"><input value={form.seller} onChange={e => setForm((f: AddForm) => ({ ...f, seller: e.target.value }))} /></Field><Field label="🔢 Quantity"><input value={form.quantity} disabled={!form.lotMode} inputMode="numeric" onChange={e => setQuantityDraft(parseInt(e.target.value) || 1)} /></Field></div>
+      <div className="twoCols"><Field label="🧑‍💼 Seller"><input value={form.seller} onChange={e => setForm((f: AddForm) => ({ ...f, seller: e.target.value }))} /></Field><Field label="🔢 Qty in Lot"><input value={form.quantity} disabled={!form.lotMode} inputMode="numeric" onChange={e => setQuantityDraft(e.target.value)} onBlur={e => { if (!e.target.value) setQuantityDraft("1"); }} /></Field></div>
       <div className="twoCols"><Field label="💵 Product Total"><input value={form.productTotal} inputMode="decimal" onChange={e => setForm((f: AddForm) => ({ ...f, productTotal: e.target.value }))} /></Field><Field label="🚚 Shipping Total"><input value={form.shippingTotal} inputMode="decimal" onChange={e => setForm((f: AddForm) => ({ ...f, shippingTotal: e.target.value }))} /></Field></div>
       <div className="calcBox"><div className="miniGrid"><Mini label="Product / Unit" value={money(formProductUnit)} /><Mini label="Shipping / Unit" value={money(formShipUnit)} /><Mini label="Total / Unit" value={money(formUnitCost)} /><Mini label="Break Even" value={formBreakEven ? money(formBreakEven) : "—"} /><Mini label="Expected Profit" value={money(expectedProfit)} /><Mini label="Expected ROI" value={pct(expectedRoi)} /></div></div>
       {!form.lotMode ? <>
@@ -691,5 +729,5 @@ function Mini({ label, value }: { label: string; value: any }) { return <div cla
 function Field({ label, children }: any) { return <label className="field"><span>{label}</span>{children}</label>; }
 
 const css = `
-*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}button{cursor:pointer}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1500px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statsGrid.wide{grid-template-columns:repeat(3,minmax(0,1fr))}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left;border:1px solid rgba(255,255,255,.10)}.clickable:hover{background:rgba(167,139,250,.16)}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.miniLine{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.miniLine small{display:block;color:#9ca3af}.empty{text-align:center;padding:38px}.empty div{font-size:48px}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar.advanced{display:grid;grid-template-columns:minmax(220px,1.7fr) repeat(6,minmax(120px,1fr))}.rangeBar,.toggleRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px;color:#c4b5fd;font-size:12px;font-weight:900}.search{min-width:320px}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:1780px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:86px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.formWrap{max-width:1040px;margin:0 auto}.formWrap h2{margin:0 0 8px}.formSub{margin:0 0 16px;color:#c4b5fd;font-size:13px;opacity:.8}.flashyForm{background:linear-gradient(135deg,rgba(124,58,237,.09),rgba(240,171,252,.05));border:1px solid rgba(167,139,250,.18);border-radius:18px;padding:18px;box-shadow:0 18px 55px rgba(124,58,237,.12)}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px;margin-bottom:8px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:360px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.lotBuilder{margin:12px 0;overflow:auto}.lotBuilder h3{color:#c4b5fd}.lotBuilderHead,.lotBuilderRow{display:grid;grid-template-columns:1.4fr 1fr 1fr .8fr 1.4fr;gap:8px;min-width:850px}.lotBuilderHead{color:#a78bfa;font-size:11px;font-weight:900;text-transform:uppercase;margin-bottom:5px}.lotBuilderRow{margin-bottom:8px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid,.statsGrid.wide{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.toolbar.advanced{display:grid;grid-template-columns:1fr 1fr}.search{min-width:0}.sheetWrap{max-height:calc(100vh - 230px)}}@media(max-width:640px){.statsGrid,.statsGrid.wide,.twoCols,.miniGrid{grid-template-columns:1fr}.toolbar.advanced{grid-template-columns:1fr}.container{width:min(100% - 22px,1500px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.inventoryTable{min-width:1780px}.sheetWrap{max-height:calc(100vh - 210px)}.lotBuilderHead,.lotBuilderRow{min-width:850px}}
+*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}button{cursor:pointer}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1500px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statsGrid.wide{grid-template-columns:repeat(3,minmax(0,1fr))}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left;border:1px solid rgba(255,255,255,.10)}.clickable:hover{background:rgba(167,139,250,.16)}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.miniLine{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.miniLine small{display:block;color:#9ca3af}.empty{text-align:center;padding:38px}.empty div{font-size:48px}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar.advanced{display:grid;grid-template-columns:minmax(220px,1.7fr) repeat(6,minmax(120px,1fr))}.rangeBar,.toggleRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px;color:#c4b5fd;font-size:12px;font-weight:900}.search{min-width:320px}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:2180px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:86px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.editSmall{border:1px solid #a78bfa;background:rgba(167,139,250,.12);color:#ddd6fe;border-radius:8px;padding:6px 9px;font-weight:850}.rowNum{color:#c4b5fd;font-weight:900;text-align:center}.countLine{font-size:13px;color:#c4b5fd;margin:0 0 8px;font-weight:850}.formWrap{max-width:1040px;margin:0 auto}.formWrap h2{margin:0 0 8px}.formSub{margin:0 0 16px;color:#c4b5fd;font-size:13px;opacity:.8}.flashyForm{background:linear-gradient(135deg,rgba(124,58,237,.09),rgba(240,171,252,.05));border:1px solid rgba(167,139,250,.18);border-radius:18px;padding:18px;box-shadow:0 18px 55px rgba(124,58,237,.12)}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px;margin-bottom:8px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:360px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.lotBuilder{margin:12px 0;overflow:auto}.lotBuilder h3{color:#c4b5fd}.lotBuilderHead,.lotBuilderRow{display:grid;grid-template-columns:1.4fr 1fr 1fr .8fr 1.4fr;gap:8px;min-width:850px}.lotBuilderHead{color:#a78bfa;font-size:11px;font-weight:900;text-transform:uppercase;margin-bottom:5px}.lotBuilderRow{margin-bottom:8px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid,.statsGrid.wide{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.toolbar.advanced{display:grid;grid-template-columns:1fr 1fr}.search{min-width:0}.sheetWrap{max-height:calc(100vh - 230px)}}@media(max-width:640px){.statsGrid,.statsGrid.wide,.twoCols,.miniGrid{grid-template-columns:1fr}.toolbar.advanced{grid-template-columns:1fr}.container{width:min(100% - 22px,1500px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.inventoryTable{min-width:2180px}.sheetWrap{max-height:calc(100vh - 210px)}.lotBuilderHead,.lotBuilderRow{min-width:850px}}
 `;
