@@ -66,21 +66,33 @@ export default function WhatnotCalculator() {
     async function loadRate() {
       setCurrencyLoading(true);
       setCurrencyError("");
+      setCurrencyRate(null);
 
       try {
-        const response = await fetch(`https://api.frankfurter.app/latest?from=${foreignCurrency}&to=USD`);
-        if (!response.ok) throw new Error("Rate request failed");
+        const url = `https://api.frankfurter.dev/v1/latest?from=${encodeURIComponent(foreignCurrency)}&to=USD`;
+        const response = await fetch(url, { cache: "no-store" });
+
+        if (!response.ok) {
+          throw new Error(`Rate request failed with status ${response.status}`);
+        }
+
         const data = await response.json();
-        const rate = data && data.rates && data.rates.USD;
-        if (!rate) throw new Error("USD rate not found");
+        const rate = Number(data?.rates?.USD);
+
+        if (!Number.isFinite(rate) || rate <= 0) {
+          throw new Error("USD rate not found in Frankfurter response");
+        }
 
         if (!cancelled) {
           setCurrencyRate(rate);
-          setRateDate(data.date || "");
+          setRateDate(data?.date || "");
         }
       } catch (err) {
+        console.error("Currency rate error:", err);
+
         if (!cancelled) {
           setCurrencyRate(null);
+          setRateDate("");
           setCurrencyError("Live rate unavailable. Try again, or enter USD manually in the calculator.");
         }
       } finally {
