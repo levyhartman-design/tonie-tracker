@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const WHATNOT_COMMISSION = 0.08;
 const WHATNOT_PROCESSING_PCT = 0.029;
@@ -35,6 +35,14 @@ export default function WhatnotCalculator() {
 
   const [inboundShipping, setInboundShipping] = useState("");
 
+  const [foreignCurrency, setForeignCurrency] = useState("GBP");
+  const [foreignPrice, setForeignPrice] = useState("");
+  const [foreignShipping, setForeignShipping] = useState("");
+  const [currencyRate, setCurrencyRate] = useState(null);
+  const [rateDate, setRateDate] = useState("");
+  const [currencyError, setCurrencyError] = useState("");
+  const [currencyLoading, setCurrencyLoading] = useState(false);
+
   const cost = parseFloat(costPaid) || 0;
   const qty = mode === "lot" ? (parseInt(quantity) || 1) : 1;
   const sale = parseFloat(salePrice) || 0;
@@ -49,6 +57,43 @@ export default function WhatnotCalculator() {
   const roi = costPerUnit > 0 ? profit / costPerUnit : null;
   const hasResult = sale > 0 && (mode === "single" ? cost > 0 : cost > 0 && qty > 0);
 
+  const foreignTotal = (parseFloat(foreignPrice) || 0) + (parseFloat(foreignShipping) || 0);
+  const convertedUsd = currencyRate && foreignTotal > 0 ? foreignTotal * currencyRate : 0;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRate() {
+      setCurrencyLoading(true);
+      setCurrencyError("");
+
+      try {
+        const response = await fetch(`https://api.frankfurter.app/latest?from=${foreignCurrency}&to=USD`);
+        if (!response.ok) throw new Error("Rate request failed");
+        const data = await response.json();
+        const rate = data && data.rates && data.rates.USD;
+        if (!rate) throw new Error("USD rate not found");
+
+        if (!cancelled) {
+          setCurrencyRate(rate);
+          setRateDate(data.date || "");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setCurrencyRate(null);
+          setCurrencyError("Live rate unavailable. Try again, or enter USD manually in the calculator.");
+        }
+      } finally {
+        if (!cancelled) setCurrencyLoading(false);
+      }
+    }
+
+    loadRate();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [foreignCurrency]);
 
   const profitColor = profit >= 0 ? "#22c55e" : "#ef4444";
   const profitBg = profit >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)";
@@ -61,27 +106,100 @@ export default function WhatnotCalculator() {
       padding: "16px 16px 96px",
       color: "#f0eeff",
     }}>
-      {/* Header */}
-      <div style={{ textAlign: "center", marginBottom: 32 }}>
-        <div style={{ fontSize: 36, marginBottom: 4 }}>🎵</div>
-        <p style={{ margin: "0 0 4px", fontSize: 13, color: "#f0abfc", fontWeight: 600, letterSpacing: 0.5 }}>
-          Made just for you, Dahlia 💜
-        </p>
-        <h1 style={{
-          margin: 0,
-          fontSize: 26,
-          fontWeight: 800,
-          letterSpacing: "-0.5px",
-          background: "linear-gradient(90deg, #a78bfa, #f0abfc)",
-          WebkitBackgroundClip: "text",
-          WebkitTextFillColor: "transparent",
-        }}>Tonie Profit Calculator</h1>
-        <p style={{ margin: "6px 0 0", color: "#a78bfa", fontSize: 13, opacity: 0.8 }}>
-          for Whatnot sellers
-        </p>
-        <p style={{ margin: "10px 0 0", fontSize: 12, color: "#c4b5fd", opacity: 0.6, fontStyle: "italic" }}>
-          with love, Levy Yitschock 💕
-        </p>
+      {/* Currency Converter */}
+      <div style={{
+        background: "rgba(255,255,255,0.06)",
+        border: "1px solid rgba(255,255,255,0.10)",
+        borderRadius: 16,
+        padding: 16,
+        marginBottom: 18,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#f5d0fe" }}>🌍 Foreign Deal Converter</div>
+            <div style={{ fontSize: 12, color: "#c4b5fd", opacity: 0.75, marginTop: 2 }}>Convert GBP/AUD/CAD into USD before using the profit calculator.</div>
+          </div>
+          <select
+            value={foreignCurrency}
+            onChange={e => setForeignCurrency(e.target.value)}
+            style={{
+              background: "rgba(255,255,255,0.08)",
+              color: "#f0eeff",
+              border: "1.5px solid rgba(255,255,255,0.15)",
+              borderRadius: 10,
+              padding: "9px 10px",
+              fontWeight: 800,
+              outline: "none",
+            }}
+          >
+            <option value="GBP">🇬🇧 GBP</option>
+            <option value="AUD">🇦🇺 AUD</option>
+            <option value="CAD">🇨🇦 CAD</option>
+          </select>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+          <Card label="Item Price">
+            <InputRow
+              prefix={foreignCurrency === "GBP" ? "£" : "$"}
+              value={foreignPrice}
+              onChange={setForeignPrice}
+              placeholder="e.g. 28.00"
+              type="number"
+            />
+          </Card>
+          <Card label="Shipping">
+            <InputRow
+              prefix={foreignCurrency === "GBP" ? "£" : "$"}
+              value={foreignShipping}
+              onChange={setForeignShipping}
+              placeholder="optional"
+              type="number"
+            />
+          </Card>
+        </div>
+
+        <div style={{
+          marginTop: 12,
+          padding: 12,
+          borderRadius: 12,
+          background: "rgba(15,12,41,0.45)",
+          border: "1px solid rgba(255,255,255,0.08)",
+        }}>
+          {currencyLoading ? (
+            <div style={{ color: "#c4b5fd", fontSize: 13 }}>Getting live exchange rate…</div>
+          ) : currencyError ? (
+            <div style={{ color: "#fca5a5", fontSize: 13 }}>{currencyError}</div>
+          ) : (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
+                <span style={{ color: "#c4b5fd", fontSize: 13 }}>USD Total</span>
+                <strong style={{ color: "#22c55e", fontSize: 24 }}>{fmt(convertedUsd)}</strong>
+              </div>
+              <div style={{ color: "#9ca3af", fontSize: 11, marginTop: 4 }}>
+                Rate used: 1 {foreignCurrency} = ${currencyRate ? currencyRate.toFixed(4) : "--"} USD{rateDate ? ` · Updated ${rateDate}` : ""}
+              </div>
+              <button
+                disabled={!convertedUsd}
+                onClick={() => setCostPaid(convertedUsd ? convertedUsd.toFixed(2) : "")}
+                style={{
+                  width: "100%",
+                  marginTop: 10,
+                  padding: "11px 12px",
+                  border: "none",
+                  borderRadius: 10,
+                  cursor: convertedUsd ? "pointer" : "not-allowed",
+                  background: convertedUsd ? "linear-gradient(135deg, #22c55e, #16a34a)" : "rgba(255,255,255,0.08)",
+                  color: "#fff",
+                  fontWeight: 800,
+                  opacity: convertedUsd ? 1 : 0.5,
+                }}
+              >
+                Use USD Total in Calculator
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Mode Toggle */}

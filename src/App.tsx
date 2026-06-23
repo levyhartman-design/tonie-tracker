@@ -10,8 +10,8 @@ const SESSION_PULL_KEY = "dahlia_tonie_session_pulled_v11";
 const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdRd2MShDnHkGfHQxIbpp7Hbn6Zn-FDDEatNDNNOq6w8kmXECMNzJlXezB/exec";
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
-const STATUSES = ["In Stock", "Listed", "Sold"];
-const SCHEMA_VERSION = "12.0-safe-sync";
+const STATUSES = ["Purchased", "Sold"];
+const SCHEMA_VERSION = "13.1-status-date";
 
 type Unit = {
   unitKey: string;
@@ -54,6 +54,7 @@ type AddForm = {
   quantity: string;
   goalSellPrice: string;
   notes: string;
+  datePurchased: string;
   unitDrafts: DraftUnit[];
 };
 
@@ -73,7 +74,7 @@ function payoutFromSale(sale: any) { const sp = num(sale); if (!sp) return null;
 function breakEven(cost: number) { return (cost + PROC_FLAT) / (1 - COMMISSION - PROC_PCT); }
 function cleanCondition(v: any) { const s = String(v ?? "").trim(); if (!s || s === "New (sealed)") return "New"; if (s === "Good") return "Used Good"; if (s === "Fair") return "Used Fair"; return CONDITIONS.includes(s) ? s : "Used Good"; }
 function safeName(v: any, fallback = "Tonie") { const s = String(v ?? "").trim(); return s && !/^\d{4}-\d{2}-\d{2}T/.test(s) ? s : fallback; }
-function normalizeStatus(v: any) { const s = String(v ?? "").trim(); return STATUSES.includes(s) ? s : "In Stock"; }
+function normalizeStatus(v: any) { const s = String(v ?? "").trim(); if (s === "Sold") return "Sold"; return "Purchased"; }
 
 const EMPTY_FORM: AddForm = {
   lotMode: false,
@@ -88,8 +89,13 @@ const EMPTY_FORM: AddForm = {
   quantity: "1",
   goalSellPrice: "",
   notes: "",
+  datePurchased: new Date().toISOString().slice(0,10),
   unitDrafts: [{ unitName: "", category: "", condition: "New", goalSellPrice: "", notes: "" }]
 };
+
+function freshEmptyForm(): AddForm {
+  return { ...EMPTY_FORM, datePurchased: new Date().toISOString().slice(0,10), unitDrafts: [{ unitName: "", category: "", condition: "New", goalSellPrice: "", notes: "" }] };
+}
 
 function normalizeUnit(raw: any): Unit {
   const lotName = safeName(raw.lotName ?? raw["Lot Name"] ?? raw.name ?? raw.unitName ?? raw["Unit Name"], "Tonie Lot");
@@ -245,7 +251,7 @@ function rowsToUnits(rows: any[]): Unit[] {
   });
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '12.0-safe-sync';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '13.1-status-date';
 
 function doPost(e) {
   try {
@@ -311,7 +317,7 @@ function writeInventory_(ss, rows) {
       r.lotName || '', r.unitName || '', r.category || '', r.condition || '', r.source || '', r.seller || '', Number(r.unitsInLot || 1),
       Number(r.lotProductTotalRaw || 0), Number(r.lotShippingTotalRaw || 0),
       Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.totalCostPerUnit || 0), Number(r.breakEven || 0),
-      r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'In Stock',
+      r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'Purchased',
       r.actualSalePrice ? Number(r.actualSalePrice) : '', r.payoutAfterFees ? Number(r.payoutAfterFees) : '', r.profitVsCost ? Number(r.profitVsCost) : '',
       r.notes || '', r.dateAdded || '', r.soldAt || '', r.updatedAt || '', r.syncedAt || new Date().toISOString()
     ]);
@@ -329,8 +335,7 @@ function writeInventory_(ss, rows) {
     var statusCell = sheet.getRange(i, 18);
     var val = statusCell.getValue();
     if (val === 'Sold') statusCell.setBackground('#d4edda').setFontColor('#155724').setFontWeight('bold');
-    if (val === 'Listed') statusCell.setBackground('#fff3cd').setFontColor('#856404').setFontWeight('bold');
-    if (val === 'In Stock') statusCell.setBackground('#cce5ff').setFontColor('#004085').setFontWeight('bold');
+    if (val === 'Purchased') statusCell.setBackground('#cce5ff').setFontColor('#004085').setFontWeight('bold');
     var profitCell = sheet.getRange(i, 21);
     var p = profitCell.getValue();
     if (p !== '') profitCell.setFontColor(Number(p) >= 0 ? '#155724' : '#721c24').setFontWeight('bold');
@@ -377,7 +382,7 @@ export default function App() {
   });
   const [view, setView] = useState("dashboard");
   const [editUnitKey, setEditUnitKey] = useState<string | null>(null);
-  const [form, setForm] = useState<AddForm>(EMPTY_FORM);
+  const [form, setForm] = useState<AddForm>(freshEmptyForm);
   const [filterStatus, setFilterStatus] = useState("All");
   const [filterCategory, setFilterCategory] = useState("All");
   const [filterCondition, setFilterCondition] = useState("All");
@@ -477,8 +482,7 @@ export default function App() {
     const invested = enriched.reduce((s, x) => s + x.totalUnit, 0);
     return {
       totalUnits: enriched.length,
-      inStock: enriched.filter(x => x.status === "In Stock").length,
-      listed: enriched.filter(x => x.status === "Listed").length,
+      purchased: enriched.filter(x => x.status === "Purchased").length,
       sold: sold.length,
       lotCount: new Set(enriched.map(x => x.lotKey)).size,
       invested,
@@ -583,6 +587,7 @@ export default function App() {
     const lotKey = uid("lot");
     const lotName = safeName(form.lotName || form.unitName, "Tonie Lot");
     const now = isoNow();
+    const purchaseDate = form.datePurchased ? isoFromDateInput(form.datePurchased) : now;
     const next: Unit[] = Array.from({ length: qty }, (_, i) => {
       const d = lotMode ? form.unitDrafts[i] || form.unitDrafts[0] : { unitName: form.unitName || form.lotName, category: form.category, condition: form.condition, goalSellPrice: form.goalSellPrice, notes: form.notes };
       return {
@@ -593,13 +598,13 @@ export default function App() {
         source: form.source || "", seller: form.seller || "",
         lotProductTotal: String(num(form.productTotal) || ""), lotShippingTotal: String(num(form.shippingTotal) || ""),
         goalSellPrice: d.goalSellPrice || form.goalSellPrice || "",
-        status: "In Stock", actualSalePrice: "", notes: d.notes || form.notes || "",
-        dateAdded: now, soldAt: "", updatedAt: now
+        status: "Purchased", actualSalePrice: "", notes: d.notes || form.notes || "",
+        dateAdded: purchaseDate, soldAt: "", updatedAt: now
       };
     });
     markDirty();
     setUnits(prev => [...next, ...prev]);
-    setForm(EMPTY_FORM);
+    setForm(freshEmptyForm());
     setView("inventory");
   }
 
@@ -648,10 +653,10 @@ function Dashboard({ stats, units, dashRange, setDashRange, setFilterStatus, set
   return <>
     <div className="rangeBar"><span>Dashboard range:</span>{["all","week","month","year"].map(r => <button key={r} onClick={() => setDashRange(r)} className={dashRange === r ? "pill active" : "pill"}>{r === "all" ? "All" : r}</button>)}</div>
     <div className="statsGrid">
-      <button className="statCard clickable" onClick={() => clickStatus("In Stock")}><span>In stock</span><b>{stats.inStock}</b><em>Click to filter</em></button>
-      <button className="statCard clickable" onClick={() => clickStatus("Listed")}><span>Listed</span><b className="gold">{stats.listed}</b><em>Ready to sell</em></button>
+      <button className="statCard clickable" onClick={() => clickStatus("Purchased")}><span>Purchased</span><b>{stats.purchased}</b><em>Not sold yet</em></button>
       <button className="statCard clickable" onClick={() => clickStatus("Sold")}><span>Sold</span><b className="green">{stats.sold}</b><em>{rangeLabel}: {stats.rangeSold}</em></button>
       <div className="statCard"><span>Total invested</span><b>{money(stats.invested)}</b><em>{stats.totalUnits} units • {stats.lotCount} lots</em></div>
+      <div className="statCard"><span>Projected profit</span><b className={stats.projectedProfit >= 0 ? "green" : "red"}>{money(stats.projectedProfit)}</b><em>Open inventory</em></div>
     </div>
     <div className="statsGrid wide">
       <div className="statCard"><span>Past sales collected</span><b>{money(stats.actualSales)}</b><em>Payout after fees: {money(stats.actualPayout)}</em></div>
@@ -737,6 +742,7 @@ function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formPr
       <div className="toggleRow"><button className={!form.lotMode ? "pill active" : "pill"} onClick={() => setForm((f: AddForm) => ({ ...f, lotMode: false, quantity: "1" }))}>Single item</button><button className={form.lotMode ? "pill active" : "pill"} onClick={() => { setForm((f: AddForm) => ({ ...f, lotMode: true })); setQuantityDraft(parseInt(form.quantity) || 2); }}>Lot builder</button></div>
       <div className="twoCols"><Field label="🧺 Lot Name"><input value={form.lotName} onChange={e => setForm((f: AddForm) => ({ ...f, lotName: e.target.value }))} placeholder="e.g. Whatnot 6/23 Lot" /></Field><Field label="🏷️ Source"><input value={form.source} onChange={e => setForm((f: AddForm) => ({ ...f, source: e.target.value }))} placeholder="Whatnot, eBay, Facebook..." /></Field></div>
       <div className="twoCols"><Field label="🧑‍💼 Seller"><input value={form.seller} onChange={e => setForm((f: AddForm) => ({ ...f, seller: e.target.value }))} /></Field><Field label="🔢 Qty in Lot"><input value={form.quantity} disabled={!form.lotMode} inputMode="numeric" onChange={e => setQuantityDraft(e.target.value)} onBlur={e => { if (!e.target.value) setQuantityDraft("1"); }} /></Field></div>
+      <div className="twoCols"><Field label="📅 Date Purchased"><input type="date" value={form.datePurchased} onChange={e => setForm((f: AddForm) => ({ ...f, datePurchased: e.target.value }))} /></Field><div></div></div>
       <div className="twoCols"><Field label="💵 Product Total"><input value={form.productTotal} inputMode="decimal" onChange={e => setForm((f: AddForm) => ({ ...f, productTotal: e.target.value }))} /></Field><Field label="🚚 Shipping Total"><input value={form.shippingTotal} inputMode="decimal" onChange={e => setForm((f: AddForm) => ({ ...f, shippingTotal: e.target.value }))} /></Field></div>
       <div className="calcBox"><div className="miniGrid"><Mini label="Product / Unit" value={money(formProductUnit)} /><Mini label="Shipping / Unit" value={money(formShipUnit)} /><Mini label="Total / Unit" value={money(formUnitCost)} /><Mini label="Break Even" value={formBreakEven ? money(formBreakEven) : "—"} /><Mini label="Expected Profit" value={money(expectedProfit)} /><Mini label="Expected ROI" value={pct(expectedRoi)} /></div></div>
       {!form.lotMode ? <>
