@@ -1,8 +1,9 @@
 {
-  "name": "Dahlia's Tonie Tracker",
+  "name": "Dahlia Tonie Tracker",
   "short_name": "Dahlia",
-  "description": "Tonie inventory, profit, and safe Google Sheets sync tracker.",
+  "description": "Dahlia Tonie inventory and sales tracker",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0d0b1e",
   "theme_color": "#4a235a",
