@@ -11,7 +11,7 @@ const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdR
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
 const STATUSES = ["In Stock", "Listed", "Sold"];
-const SCHEMA_VERSION = "11.0-safe-edit";
+const SCHEMA_VERSION = "12.0-safe-sync";
 
 type Unit = {
   unitKey: string;
@@ -245,7 +245,7 @@ function rowsToUnits(rows: any[]): Unit[] {
   });
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '11.0-safe-edit';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '12.0-safe-sync';
 
 function doPost(e) {
   try {
@@ -389,18 +389,26 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "success" | "error">("idle");
   const [message, setMessage] = useState("");
   const [lastPullInfo, setLastPullInfo] = useState("");
+  const [hasPulledThisSession, setHasPulledThisSession] = useState(() => sessionStorage.getItem(SESSION_PULL_KEY) === "1");
+  const [dirty, setDirty] = useState(false);
   const autoTimer = useRef<any>(null);
   const cloudLoaded = useRef(false);
   const skipNextAutoPush = useRef(false);
+  const unitsRef = useRef<Unit[]>(units);
+  const dirtyRef = useRef(false);
+  const hasPulledRef = useRef(hasPulledThisSession);
 
-  useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(units)); } catch {} }, [units]);
+  useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(units)); } catch {}; unitsRef.current = units; }, [units]);
   useEffect(() => { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {} }, [settings]);
+  useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
+  useEffect(() => { hasPulledRef.current = hasPulledThisSession; }, [hasPulledThisSession]);
 
   useEffect(() => {
     const alreadyPulled = sessionStorage.getItem(SESSION_PULL_KEY) === "1";
     if (settings.syncMode === "auto" && !alreadyPulled) {
       safePullFromSheets(true);
     } else {
+      setHasPulledThisSession(alreadyPulled);
       cloudLoaded.current = true;
     }
   }, []);
@@ -408,11 +416,27 @@ export default function App() {
   useEffect(() => {
     if (!cloudLoaded.current) return;
     if (skipNextAutoPush.current) { skipNextAutoPush.current = false; return; }
+    if (!hasPulledThisSession) return;
+    if (!dirty) return;
     if (settings.syncMode === "auto") {
       clearTimeout(autoTimer.current);
-      autoTimer.current = setTimeout(() => doPush(true), 1300);
+      autoTimer.current = setTimeout(() => doPush(true), 12000);
     }
-  }, [units, settings.syncMode]);
+  }, [units, dirty, hasPulledThisSession, settings.syncMode]);
+
+  useEffect(() => {
+    const emergencyPush = () => {
+      if (!dirtyRef.current || !hasPulledRef.current) return;
+      try {
+        const payload = JSON.stringify({ action: "syncInventory", schemaVersion: SCHEMA_VERSION, rows: toSheetRows(unitsRef.current) });
+        fetch(DEFAULT_SCRIPT_URL, { method: "POST", mode: "no-cors", keepalive: true, headers: { "Content-Type": "text/plain;charset=utf-8" }, body: payload });
+      } catch {}
+    };
+    const onVisibility = () => { if (document.visibilityState === "hidden") emergencyPush(); };
+    window.addEventListener("pagehide", emergencyPush);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => { window.removeEventListener("pagehide", emergencyPush); document.removeEventListener("visibilitychange", onVisibility); };
+  }, []);
 
   const enriched = useMemo(() => enrichUnits(units), [units]);
   const categories = useMemo(() => Array.from(new Set(units.map(x => x.category).filter(Boolean))).sort(), [units]);
@@ -471,11 +495,19 @@ export default function App() {
 
   function flash(text: string) { setMessage(text); setTimeout(() => setMessage(""), 3500); }
   function localBackup(label: string) { try { localStorage.setItem(`dahlia_backup_${label}_${Date.now()}`, JSON.stringify(units)); } catch {} }
+  function markDirty() { setDirty(true); }
 
-  async function doPush(silent = false) {
+  async function doPush(silent = false, force = false) {
+    if (!force && !hasPulledThisSession) {
+      setSyncStatus("error");
+      if (!silent) flash("Push blocked: first pull from Google Sheets this session.");
+      setTimeout(() => setSyncStatus("idle"), 2600);
+      return;
+    }
     setSyncStatus("syncing");
     try {
       await pushToSheets(units);
+      setDirty(false);
       setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true }));
       setSyncStatus("success");
       if (!silent) flash("Pushed safely to Google Sheets");
@@ -497,7 +529,9 @@ export default function App() {
       localBackup("before_pull");
       skipNextAutoPush.current = true;
       setUnits(next);
+      setDirty(false);
       sessionStorage.setItem(SESSION_PULL_KEY, "1");
+      setHasPulledThisSession(true);
       cloudLoaded.current = true;
       setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true }));
       setLastPullInfo(`Pulled ${next.length} units from Sheets`);
@@ -508,6 +542,7 @@ export default function App() {
   }
 
   function updateUnit(unitKey: string, changes: Partial<Unit>) {
+    markDirty();
     setUnits(prev => prev.map(u => {
       if (u.unitKey !== unitKey) return u;
       const next = { ...u, ...changes, updatedAt: isoNow() };
@@ -518,11 +553,13 @@ export default function App() {
   }
 
   function updateLotShared(lotKey: string, changes: Partial<Unit>) {
+    markDirty();
     setUnits(prev => prev.map(u => u.lotKey === lotKey ? { ...u, ...changes, updatedAt: isoNow() } : u));
   }
 
   function deleteUnit(unitKey: string) {
     if (!confirm("Delete this unit?")) return;
+    markDirty();
     setUnits(prev => prev.filter(u => u.unitKey !== unitKey));
   }
 
@@ -560,12 +597,13 @@ export default function App() {
         dateAdded: now, soldAt: "", updatedAt: now
       };
     });
+    markDirty();
     setUnits(prev => [...next, ...prev]);
     setForm(EMPTY_FORM);
     setView("inventory");
   }
 
-  const syncText = syncStatus === "syncing" ? "⏳ Syncing" : syncStatus === "success" ? "✓ Synced" : syncStatus === "error" ? "✗ Sync failed" : settings.lastSynced ? `☁ ${dateText(settings.lastSynced)}` : "☁ Ready";
+  const syncText = syncStatus === "syncing" ? "⏳ Syncing" : syncStatus === "success" ? "✓ Synced" : syncStatus === "error" ? "✗ Sync failed" : !hasPulledThisSession ? "Pull required before push" : dirty ? "🟡 Unsaved changes" : settings.lastSynced ? `☁ ${dateText(settings.lastSynced)}` : "☁ Ready";
   const formQty = form.lotMode ? Math.max(1, parseInt(form.quantity) || 1) : 1;
   const formProductUnit = num(form.productTotal) / formQty;
   const formShipUnit = num(form.shippingTotal) / formQty;
@@ -590,7 +628,7 @@ export default function App() {
       {view === "edit" && <EditUnitView unit={enriched.find(u => u.unitKey === editUnitKey)} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} setView={setView} />}
       {view === "add" && <AddFormView form={form} setForm={setForm} setQuantityDraft={setQuantityDraft} saveNew={saveNew} formQty={formQty} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} expectedProfit={expectedProfit} expectedRoi={expectedRoi} />}
       {view === "calculator" && <WhatnotCalculator />}
-      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} />}
+      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} hasPulledThisSession={hasPulledThisSession} dirty={dirty} />}
     </main>
     <nav className="nav">
       <button onClick={() => setView("dashboard")} className={view === "dashboard" ? "navBtn active" : "navBtn"}>📊<span>Dashboard</span></button>
@@ -711,13 +749,13 @@ function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formPr
   </div>;
 }
 
-function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastPullInfo, setUnits }: any) {
+function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastPullInfo, setUnits, hasPulledThisSession, dirty }: any) {
   return <div className="formWrap">
     <h2>⚙️ Settings & Safe Sync</h2>
-    <div className="panel"><h3>Google Sheets Sync</h3><p className="muted">Sync buttons live only here to prevent accidental pulls. The app auto-pulls once per browser session, then auto-pushes after edits.</p>
-      <Field label="Sync Mode"><select value={settings.syncMode} onChange={e => setSettings((s: Settings) => ({ ...s, syncMode: e.target.value as Settings["syncMode"] }))}><option value="auto">Auto: pull once per session, then push after edits</option><option value="manual">Manual only</option></select></Field>
-      <div className="buttonRow"><button className="primary" onClick={() => doPush(false)}>Push current app data to Sheets</button><button className="secondary danger" onClick={() => safePullFromSheets(false, false)}>Pull from Sheets - requires confirmation</button></div>
-      <p className="muted">Last synced: {dateText(settings.lastSynced)} {lastPullInfo ? `• ${lastPullInfo}` : ""}</p>
+    <div className="panel"><h3>Google Sheets Sync</h3><p className="muted">Sync buttons live only here to prevent accidental pulls. Push is blocked until this browser session has successfully pulled from Google Sheets.</p>
+      <Field label="Sync Mode"><select value={settings.syncMode} onChange={e => setSettings((s: Settings) => ({ ...s, syncMode: e.target.value as Settings["syncMode"] }))}><option value="auto">Auto: pull once per session, then batch-push after edits</option><option value="manual">Manual only</option></select></Field>
+      <div className="syncStateBox"><b>{hasPulledThisSession ? "✅ Sheet loaded this session" : "⚠️ Pull required before any push"}</b><span>{dirty ? "Unsaved changes waiting to sync." : "No unsaved local changes."}</span></div><div className="buttonRow">{hasPulledThisSession ? <button className="primary" onClick={() => doPush(false)}>Save / Push to Sheet Now</button> : <button className="primary" disabled title="Pull first to unlock pushing">Save / Push locked until Pull</button>}<button className="secondary danger" onClick={() => safePullFromSheets(false, false)}>Pull from Sheets - requires confirmation</button></div>
+      <p className="muted">Last synced: {dateText(settings.lastSynced)} {lastPullInfo ? `• ${lastPullInfo}` : ""}</p><p className="muted">Auto-push rule: after a successful pull, edits save locally right away and push to Sheets after about 12 seconds of no activity. Closing/switching apps also attempts an emergency push, but the manual Save button is the safest confirmation.</p>
     </div>
     <div className="panel"><h3>New Google Apps Script</h3><p className="muted">Replace the old Apps Script with this exact code and deploy a new version.</p><textarea className="codeBox" readOnly value={APPS_SCRIPT_CODE} onFocus={(e) => e.currentTarget.select()} /><Field label="Apps Script URL"><input value={DEFAULT_SCRIPT_URL} readOnly /></Field></div>
     <div className="panel"><h3>Backup reminder</h3><p className="muted">The script includes backupInventoryNow() and createTwiceDailyBackupTrigger(). Run createTwiceDailyBackupTrigger once inside Google Apps Script to create automatic backups every 12 hours.</p></div>
@@ -729,5 +767,5 @@ function Mini({ label, value }: { label: string; value: any }) { return <div cla
 function Field({ label, children }: any) { return <label className="field"><span>{label}</span>{children}</label>; }
 
 const css = `
-*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}button{cursor:pointer}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1500px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statsGrid.wide{grid-template-columns:repeat(3,minmax(0,1fr))}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left;border:1px solid rgba(255,255,255,.10)}.clickable:hover{background:rgba(167,139,250,.16)}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.miniLine{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.miniLine small{display:block;color:#9ca3af}.empty{text-align:center;padding:38px}.empty div{font-size:48px}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar.advanced{display:grid;grid-template-columns:minmax(220px,1.7fr) repeat(6,minmax(120px,1fr))}.rangeBar,.toggleRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px;color:#c4b5fd;font-size:12px;font-weight:900}.search{min-width:320px}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:2180px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:86px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.editSmall{border:1px solid #a78bfa;background:rgba(167,139,250,.12);color:#ddd6fe;border-radius:8px;padding:6px 9px;font-weight:850}.rowNum{color:#c4b5fd;font-weight:900;text-align:center}.countLine{font-size:13px;color:#c4b5fd;margin:0 0 8px;font-weight:850}.formWrap{max-width:1040px;margin:0 auto}.formWrap h2{margin:0 0 8px}.formSub{margin:0 0 16px;color:#c4b5fd;font-size:13px;opacity:.8}.flashyForm{background:linear-gradient(135deg,rgba(124,58,237,.09),rgba(240,171,252,.05));border:1px solid rgba(167,139,250,.18);border-radius:18px;padding:18px;box-shadow:0 18px 55px rgba(124,58,237,.12)}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px;margin-bottom:8px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:360px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.lotBuilder{margin:12px 0;overflow:auto}.lotBuilder h3{color:#c4b5fd}.lotBuilderHead,.lotBuilderRow{display:grid;grid-template-columns:1.4fr 1fr 1fr .8fr 1.4fr;gap:8px;min-width:850px}.lotBuilderHead{color:#a78bfa;font-size:11px;font-weight:900;text-transform:uppercase;margin-bottom:5px}.lotBuilderRow{margin-bottom:8px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid,.statsGrid.wide{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.toolbar.advanced{display:grid;grid-template-columns:1fr 1fr}.search{min-width:0}.sheetWrap{max-height:calc(100vh - 230px)}}@media(max-width:640px){.statsGrid,.statsGrid.wide,.twoCols,.miniGrid{grid-template-columns:1fr}.toolbar.advanced{grid-template-columns:1fr}.container{width:min(100% - 22px,1500px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.inventoryTable{min-width:2180px}.sheetWrap{max-height:calc(100vh - 210px)}.lotBuilderHead,.lotBuilderRow{min-width:850px}}
+*{box-sizing:border-box}body{margin:0}.page{min-height:100vh;background:linear-gradient(160deg,#0d0b1e 0%,#1a1035 60%,#0d1a2e 100%);color:#f8f7ff;font-family:Inter,system-ui,Segoe UI,sans-serif;padding-bottom:86px}.header{text-align:center;padding:22px 14px 10px;position:relative}.bear{font-size:31px}.header h1{margin:0;font-size:27px;font-weight:950;background:linear-gradient(90deg,#a78bfa,#f0abfc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.sub{font-size:12px;color:#c4b5fd;opacity:.75;font-style:italic}.syncBar{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:10px;flex-wrap:wrap}.syncBadge,.smallBtn{font-size:12px;padding:5px 10px;border-radius:9px;background:rgba(255,255,255,.065);font-weight:800;border:1px solid rgba(255,255,255,.12);color:#ddd6fe}.syncBadge.success{color:#22c55e}.syncBadge.error{color:#f87171}.syncBadge.syncing{color:#93c5fd}button{cursor:pointer}.toast{position:absolute;right:16px;top:12px;background:rgba(34,197,94,.16);color:#86efac;padding:7px 11px;border-radius:10px;font-size:12px;font-weight:850}.container{width:min(1500px,calc(100% - 28px));margin:0 auto}.statsGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.statsGrid.wide{grid-template-columns:repeat(3,minmax(0,1fr))}.statCard,.panel,.empty,.unitCard,.calcBox{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;color:inherit}.statCard{text-align:left;border:1px solid rgba(255,255,255,.10)}.clickable:hover{background:rgba(167,139,250,.16)}.statCard span,.muted{color:#9ca3af;font-size:12px;line-height:1.5}.statCard b{display:block;font-size:25px;font-weight:950}.statCard em{display:block;font-size:12px;color:#9ca3af;font-style:normal}.gold{color:#fbbf24}.green,.profitGood{color:#22c55e}.red,.profitBad{color:#ef4444}.dashGrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px}.panel h3{margin:0 0 12px;color:#c4b5fd;font-size:14px;text-transform:uppercase;letter-spacing:.8px}.miniLine{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:10px;border-radius:10px;background:rgba(255,255,255,.04);margin-bottom:8px}.miniLine small{display:block;color:#9ca3af}.empty{text-align:center;padding:38px}.empty div{font-size:48px}button:disabled{opacity:.45;cursor:not-allowed}.syncStateBox{display:flex;flex-direction:column;gap:4px;margin:10px 0 14px;padding:12px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.11)}.syncStateBox span{font-size:12px;color:#9ca3af}.primary,.secondary{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;font-weight:900}.secondary{background:transparent;border:1.5px solid #7c3aed;color:#c4b5fd;margin-left:10px}.danger{color:#f87171;border-color:#ef4444}.toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}.toolbar.advanced{display:grid;grid-template-columns:minmax(220px,1.7fr) repeat(6,minmax(120px,1fr))}.rangeBar,.toggleRow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 12px;color:#c4b5fd;font-size:12px;font-weight:900}.search{min-width:320px}.pill{border:1.5px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#9ca3af;border-radius:999px;padding:8px 14px;font-weight:850}.pill.active{border-color:#a78bfa;color:#fff;background:rgba(167,139,250,.2)}input,select,textarea{width:100%;background:rgba(255,255,255,.075);border:1.5px solid rgba(255,255,255,.13);border-radius:10px;padding:9px 10px;color:#f8f7ff;font-size:14px;outline:none;font-family:inherit}textarea{min-height:74px}.sheetWrap{overflow:auto;border:1px solid rgba(255,255,255,.11);border-radius:14px;background:rgba(255,255,255,.035)}.inventoryTable{width:100%;border-collapse:collapse;min-width:2180px}.inventoryTable th{position:sticky;top:0;background:#27183f;color:#ddd6fe;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px;border-bottom:1px solid rgba(255,255,255,.12);z-index:1}.inventoryTable td{padding:7px;border-bottom:1px solid rgba(255,255,255,.08);font-size:13px;white-space:nowrap}.inventoryTable tr:hover{background:rgba(255,255,255,.04)}.inventoryTable input,.inventoryTable select{padding:6px 7px;border-radius:7px;font-size:13px;min-width:86px}.dangerSmall{border:1px solid #ef4444;background:transparent;color:#f87171;border-radius:8px;padding:6px 9px;font-weight:850}.editSmall{border:1px solid #a78bfa;background:rgba(167,139,250,.12);color:#ddd6fe;border-radius:8px;padding:6px 9px;font-weight:850}.rowNum{color:#c4b5fd;font-weight:900;text-align:center}.countLine{font-size:13px;color:#c4b5fd;margin:0 0 8px;font-weight:850}.formWrap{max-width:1040px;margin:0 auto}.formWrap h2{margin:0 0 8px}.formSub{margin:0 0 16px;color:#c4b5fd;font-size:13px;opacity:.8}.flashyForm{background:linear-gradient(135deg,rgba(124,58,237,.09),rgba(240,171,252,.05));border:1px solid rgba(167,139,250,.18);border-radius:18px;padding:18px;box-shadow:0 18px 55px rgba(124,58,237,.12)}.twoCols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:block;margin-bottom:14px;color:#a78bfa;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.7px}.field span{display:block;margin-bottom:6px}.miniGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.mini{background:rgba(255,255,255,.045);border-radius:10px;padding:10px;margin-bottom:8px}.mini small{display:block;color:#9ca3af;font-size:10px;margin-bottom:3px}.mini b{font-size:14px}.calcBox{margin-bottom:14px}.codeBox{min-height:360px;font-family:monospace;font-size:12px}.buttonRow{display:flex;gap:10px;flex-wrap:wrap}.dangerPanel{border-color:rgba(239,68,68,.35);margin-top:12px}.lotBuilder{margin:12px 0;overflow:auto}.lotBuilder h3{color:#c4b5fd}.lotBuilderHead,.lotBuilderRow{display:grid;grid-template-columns:1.4fr 1fr 1fr .8fr 1.4fr;gap:8px;min-width:850px}.lotBuilderHead{color:#a78bfa;font-size:11px;font-weight:900;text-transform:uppercase;margin-bottom:5px}.lotBuilderRow{margin-bottom:8px}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(13,11,30,.96);backdrop-filter:blur(12px);border-top:1px solid rgba(255,255,255,.08);display:flex;padding:8px 0 12px;z-index:10}.navBtn{flex:1;background:none;border:0;color:#6b7280;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:20px;font-weight:850}.navBtn span{font-size:10px}.navBtn.active{color:#c4b5fd}option{background:#0d0b1e;color:#fff}@media(max-width:1050px){.statsGrid,.statsGrid.wide{grid-template-columns:repeat(2,1fr)}.dashGrid{grid-template-columns:1fr}.toolbar.advanced{display:grid;grid-template-columns:1fr 1fr}.search{min-width:0}.sheetWrap{max-height:calc(100vh - 230px)}}@media(max-width:640px){.statsGrid,.statsGrid.wide,.twoCols,.miniGrid{grid-template-columns:1fr}.toolbar.advanced{grid-template-columns:1fr}.container{width:min(100% - 22px,1500px)}.header h1{font-size:24px}.toast{position:static;display:inline-block;margin-top:8px}.secondary{margin-left:0;margin-top:8px}.inventoryTable{min-width:2180px}.sheetWrap{max-height:calc(100vh - 210px)}.lotBuilderHead,.lotBuilderRow{min-width:850px}}
 `;
