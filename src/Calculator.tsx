@@ -27,6 +27,8 @@ function fmtPct(n) {
 
 export default function WhatnotCalculator() {
   const [mode, setMode] = useState("single"); // "single" | "lot"
+  const [lotPricingMode, setLotPricingMode] = useState("same"); // "same" | "mixed"
+  const [priceTiers, setPriceTiers] = useState([{ id: "tier_1", qty: "", salePrice: "" }]);
   const [costPaid, setCostPaid] = useState("");
   const [quantity, setQuantity] = useState("");
   const [salePrice, setSalePrice] = useState("");
@@ -59,6 +61,44 @@ export default function WhatnotCalculator() {
 
   const foreignTotal = (parseFloat(foreignPrice) || 0) + (parseFloat(foreignShipping) || 0);
   const convertedUsd = currencyRate && foreignTotal > 0 ? foreignTotal * currencyRate : 0;
+
+  const isMixedLot = mode === "lot" && lotPricingMode === "mixed";
+  const tierData = priceTiers.map(t => {
+    const tierQty = parseInt(t.qty) || 0;
+    const tierSale = parseFloat(t.salePrice) || 0;
+    const tierFees = calcFees(tierSale, sellerShipping);
+    return {
+      ...t,
+      qty: tierQty,
+      salePrice: tierSale,
+      revenue: tierQty * tierSale,
+      payout: tierQty * tierFees.netPayout,
+      fees: tierQty * tierFees.totalFees,
+    };
+  });
+  const allocatedQty = tierData.reduce((sum, t) => sum + t.qty, 0);
+  const unallocatedQty = qty - allocatedQty;
+  const mixedRevenue = tierData.reduce((sum, t) => sum + t.revenue, 0);
+  const mixedPayout = tierData.reduce((sum, t) => sum + t.payout, 0);
+  const mixedFees = tierData.reduce((sum, t) => sum + t.fees, 0);
+  const mixedProfit = mixedPayout - totalCost;
+  const mixedProfitPerUnit = qty > 0 ? mixedProfit / qty : 0;
+  const mixedAvgSale = allocatedQty > 0 ? mixedRevenue / allocatedQty : 0;
+  const mixedRoi = totalCost > 0 ? mixedProfit / totalCost : null;
+  const hasMixedResult = isMixedLot && cost > 0 && qty > 0 && allocatedQty > 0;
+  const hasSingleResult = !isMixedLot && hasResult;
+
+  function addTier() {
+    setPriceTiers(prev => [...prev, { id: `tier_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, qty: "", salePrice: "" }]);
+  }
+
+  function updateTier(id, field, value) {
+    setPriceTiers(prev => prev.map(t => t.id === id ? { ...t, [field]: value } : t));
+  }
+
+  function removeTier(id) {
+    setPriceTiers(prev => prev.length <= 1 ? prev : prev.filter(t => t.id !== id));
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -207,7 +247,7 @@ export default function WhatnotCalculator() {
                   opacity: convertedUsd ? 1 : 0.5,
                 }}
               >
-                Use USD Total in Calculator
+                {mode === "lot" ? "Use USD Total as Lot Cost" : "Use USD Total in Calculator"}
               </button>
             </>
           )}
@@ -292,15 +332,116 @@ export default function WhatnotCalculator() {
           )}
         </Card>
 
-        <Card label="🏷️ Your Sale Price on Whatnot">
-          <InputRow
-            prefix="$"
-            value={salePrice}
-            onChange={setSalePrice}
-            placeholder="e.g. 18.00"
-            type="number"
-          />
-        </Card>
+        {mode === "lot" ? (
+          <Card label="🏷️ Sale Price Plan">
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              {["same", "mixed"].map(plan => (
+                <button
+                  key={plan}
+                  onClick={() => setLotPricingMode(plan)}
+                  style={{
+                    flex: 1,
+                    padding: "9px 0",
+                    borderRadius: 9,
+                    border: `1.5px solid ${lotPricingMode === plan ? "#a855f7" : "rgba(255,255,255,0.12)"}`,
+                    background: lotPricingMode === plan ? "rgba(168,85,247,0.18)" : "transparent",
+                    color: lotPricingMode === plan ? "#e9d5ff" : "#9ca3af",
+                    fontWeight: 800,
+                    cursor: "pointer",
+                  }}
+                >
+                  {plan === "same" ? "Same price" : "Mixed prices"}
+                </button>
+              ))}
+            </div>
+
+            {lotPricingMode === "same" ? (
+              <InputRow
+                prefix="$"
+                value={salePrice}
+                onChange={setSalePrice}
+                placeholder="e.g. 18.00"
+                type="number"
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "80px 1fr 40px", gap: 8, color: "#a78bfa", fontSize: 11, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.7 }}>
+                  <span>Qty</span><span>Sale price</span><span></span>
+                </div>
+                {priceTiers.map((tier, idx) => (
+                  <div key={tier.id} style={{ display: "grid", gridTemplateColumns: "80px 1fr 40px", gap: 8, alignItems: "center" }}>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={tier.qty}
+                      onChange={e => updateTier(tier.id, "qty", e.target.value)}
+                      placeholder="10"
+                      style={miniInputStyle()}
+                    />
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ color: "#6b7280", fontWeight: 800 }}>$</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={tier.salePrice}
+                        onChange={e => updateTier(tier.id, "salePrice", e.target.value)}
+                        placeholder="35.00"
+                        style={miniInputStyle()}
+                      />
+                    </div>
+                    <button
+                      onClick={() => removeTier(tier.id)}
+                      disabled={priceTiers.length <= 1}
+                      style={{
+                        height: 38,
+                        borderRadius: 9,
+                        border: "1px solid rgba(255,255,255,0.12)",
+                        background: "rgba(255,255,255,0.05)",
+                        color: priceTiers.length <= 1 ? "#4b5563" : "#fca5a5",
+                        cursor: priceTiers.length <= 1 ? "not-allowed" : "pointer",
+                        fontWeight: 900,
+                      }}
+                    >×</button>
+                  </div>
+                ))}
+                <button
+                  onClick={addTier}
+                  style={{
+                    marginTop: 4,
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px dashed rgba(168,85,247,0.55)",
+                    background: "rgba(168,85,247,0.10)",
+                    color: "#e9d5ff",
+                    fontWeight: 900,
+                    cursor: "pointer",
+                  }}
+                >
+                  + Add Price Tier
+                </button>
+                <div style={{ fontSize: 12, color: unallocatedQty === 0 ? "#86efac" : unallocatedQty > 0 ? "#fde68a" : "#fca5a5", marginTop: 4 }}>
+                  {unallocatedQty === 0
+                    ? `🟢 Complete: ${allocatedQty} of ${qty} units allocated`
+                    : unallocatedQty > 0
+                      ? `🟡 Missing ${unallocatedQty} of ${qty} units`
+                      : `🔴 Over by ${Math.abs(unallocatedQty)} units`}
+                </div>
+              </div>
+            )}
+          </Card>
+        ) : (
+          <Card label="🏷️ Your Sale Price on Whatnot">
+            <InputRow
+              prefix="$"
+              value={salePrice}
+              onChange={setSalePrice}
+              placeholder="e.g. 18.00"
+              type="number"
+            />
+          </Card>
+        )}
 
         {/* Shipping */}
         <Card label="📦 Shipping (optional)">
@@ -343,8 +484,84 @@ export default function WhatnotCalculator() {
         </Card>
       </div>
 
+      {/* Mixed Lot Results */}
+      {hasMixedResult && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{
+            background: mixedProfit >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+            border: `1.5px solid ${mixedProfit >= 0 ? "#22c55e" : "#ef4444"}40`,
+            borderRadius: 16,
+            padding: "20px 20px 16px",
+            marginBottom: 16,
+            textAlign: "center",
+          }}>
+            <div style={{ fontSize: 12, color: "#9ca3af", marginBottom: 6, textTransform: "uppercase", letterSpacing: 1 }}>
+              📦 Projected Lot Profit
+            </div>
+            <div style={{ fontSize: 42, fontWeight: 900, color: mixedProfit >= 0 ? "#22c55e" : "#ef4444", letterSpacing: "-1px" }}>
+              {fmt(mixedProfit)}
+            </div>
+            <div style={{ fontSize: 13, color: mixedProfit >= 0 ? "#22c55e" : "#ef4444", opacity: 0.85, marginTop: 4 }}>
+              {fmt(mixedProfitPerUnit)} per unit{mixedRoi !== null ? ` · ${mixedProfit >= 0 ? "+" : ""}${fmtPct(mixedRoi)} ROI` : ""}
+            </div>
+          </div>
+
+          <div style={{
+            background: "rgba(255,255,255,0.04)",
+            borderRadius: 14,
+            overflow: "hidden",
+            border: "1px solid rgba(255,255,255,0.07)",
+          }}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)", fontSize: 11, color: "#6b7280", textTransform: "uppercase", letterSpacing: 1 }}>
+              Mixed Lot Breakdown
+            </div>
+            {[
+              { label: "Lot quantity", value: `${qty} units` },
+              { label: "Allocated quantity", value: `${allocatedQty} units` },
+              { label: "Average sale price", value: fmt(mixedAvgSale) },
+              { label: "Total projected sales", value: fmt(mixedRevenue), neutral: true },
+              { label: "Estimated Whatnot fees", value: `-${fmt(mixedFees)}`, neg: true },
+              shippingPaidBy === "seller" && shipping > 0
+                ? { label: "Seller-paid shipping", value: `Included per tier`, neg: true }
+                : null,
+              { label: "Estimated payout", value: fmt(mixedPayout), bold: true },
+              { label: "Lot cost + inbound shipping", value: `-${fmt(totalCost)}`, neg: true },
+            ].filter(Boolean).map((row, i) => (
+              <div key={i} style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "11px 16px",
+                borderBottom: "1px solid rgba(255,255,255,0.04)",
+                fontSize: 14,
+              }}>
+                <span style={{ color: "#d1d5db" }}>{row.label}</span>
+                <span style={{
+                  fontWeight: row.bold ? 700 : 500,
+                  color: row.bold ? "#f0eeff" : row.neg ? "#f87171" : row.neutral ? "#c4b5fd" : "#f0eeff",
+                  fontVariantNumeric: "tabular-nums",
+                }}>
+                  {row.value}
+                </span>
+              </div>
+            ))}
+            <div style={{
+              display: "flex",
+              justifyContent: "space-between",
+              padding: "13px 16px",
+              background: mixedProfit >= 0 ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+              fontSize: 15,
+              fontWeight: 800,
+            }}>
+              <span style={{ color: "#e9d5ff" }}>Projected profit</span>
+              <span style={{ color: mixedProfit >= 0 ? "#22c55e" : "#ef4444" }}>{fmt(mixedProfit)}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Results */}
-      {hasResult && (
+      {hasSingleResult && (
         <div style={{ marginTop: 24 }}>
           {/* Big profit number */}
           <div style={{
@@ -472,6 +689,21 @@ function Card({ label, children }) {
       {children}
     </div>
   );
+}
+
+function miniInputStyle() {
+  return {
+    width: "100%",
+    background: "rgba(255,255,255,0.07)",
+    border: "1.5px solid rgba(255,255,255,0.12)",
+    borderRadius: 9,
+    padding: "9px 10px",
+    color: "#f0eeff",
+    fontSize: 15,
+    fontWeight: 700,
+    outline: "none",
+    boxSizing: "border-box",
+  };
 }
 
 function InputRow({ prefix, suffix, value, onChange, placeholder, type = "text" }) {

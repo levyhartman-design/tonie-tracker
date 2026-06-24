@@ -10,8 +10,8 @@ const SESSION_PULL_KEY = "dahlia_tonie_session_pulled_v11";
 const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdRd2MShDnHkGfHQxIbpp7Hbn6Zn-FDDEatNDNNOq6w8kmXECMNzJlXezB/exec";
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
-const STATUSES = ["Purchased", "Sold"];
-const SCHEMA_VERSION = "13.1-status-date";
+const STATUSES = ["Purchased", "In Stock", "Sold"];
+const SCHEMA_VERSION = "15.0-status-lotcalc";
 
 type Unit = {
   unitKey: string;
@@ -30,6 +30,7 @@ type Unit = {
   notes: string;
   dateAdded: string;
   soldAt: string;
+  dateReceived: string;
   updatedAt: string;
 };
 
@@ -74,7 +75,7 @@ function payoutFromSale(sale: any) { const sp = num(sale); if (!sp) return null;
 function breakEven(cost: number) { return (cost + PROC_FLAT) / (1 - COMMISSION - PROC_PCT); }
 function cleanCondition(v: any) { const s = String(v ?? "").trim(); if (!s || s === "New (sealed)") return "New"; if (s === "Good") return "Used Good"; if (s === "Fair") return "Used Fair"; return CONDITIONS.includes(s) ? s : "Used Good"; }
 function safeName(v: any, fallback = "Tonie") { const s = String(v ?? "").trim(); return s && !/^\d{4}-\d{2}-\d{2}T/.test(s) ? s : fallback; }
-function normalizeStatus(v: any) { const s = String(v ?? "").trim(); if (s === "Sold") return "Sold"; return "Purchased"; }
+function normalizeStatus(v: any) { const s = String(v ?? "").trim(); if (s === "Sold") return "Sold"; if (s === "In Stock" || s === "Listed") return "In Stock"; return "Purchased"; }
 
 const EMPTY_FORM: AddForm = {
   lotMode: false,
@@ -123,6 +124,7 @@ function normalizeUnit(raw: any): Unit {
     notes: String(raw.notes ?? raw["Notes"] ?? ""),
     dateAdded: String(raw.dateAdded ?? raw["Date Purchased"] ?? raw["Date Added"] ?? isoNow()),
     soldAt: String(raw.soldAt ?? raw["Date Sold"] ?? raw["Sold At"] ?? ""),
+    dateReceived: String(raw.dateReceived ?? raw["Date Received"] ?? raw["Received At"] ?? ""),
     updatedAt: String(raw.updatedAt ?? raw["Updated At"] ?? isoNow())
   };
 }
@@ -186,6 +188,7 @@ function toSheetRows(units: Unit[]) {
     profitVsCost: u.profit !== null ? u.profit.toFixed(2) : "",
     notes: u.notes || "",
     dateAdded: u.dateAdded || isoNow(),
+    dateReceived: u.dateReceived || "",
     soldAt: u.soldAt || "",
     updatedAt: u.updatedAt || isoNow(),
     syncedAt: isoNow()
@@ -251,7 +254,7 @@ function rowsToUnits(rows: any[]): Unit[] {
   });
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '13.1-status-date';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '15.0-status-lotcalc';
 
 function doPost(e) {
   try {
@@ -300,14 +303,14 @@ function writeInventory_(ss, rows) {
   var sheet = ss.getSheetByName('Inventory') || ss.insertSheet('Inventory');
   sheet.clearContents();
   sheet.clearFormats();
-  sheet.showColumns(1, 26);
+  sheet.showColumns(1, 27);
 
   var headers = [
     'Internal Unit Key','Internal Lot Key','Schema Version',
     'Lot Name','Unit Name','Category','Condition','Source','Seller','Qty in Lot',
     'Lot Product Total Raw','Lot Shipping Total Raw',
     'Product Cost / Unit','Shipping / Unit','Total Cost / Unit','Break Even',
-    'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Purchased','Date Sold','Updated At','Synced At'
+    'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Purchased','Date Received','Date Sold','Updated At','Synced At'
   ];
   sheet.appendRow(headers);
 
@@ -319,7 +322,7 @@ function writeInventory_(ss, rows) {
       Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.totalCostPerUnit || 0), Number(r.breakEven || 0),
       r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'Purchased',
       r.actualSalePrice ? Number(r.actualSalePrice) : '', r.payoutAfterFees ? Number(r.payoutAfterFees) : '', r.profitVsCost ? Number(r.profitVsCost) : '',
-      r.notes || '', r.dateAdded || '', r.soldAt || '', r.updatedAt || '', r.syncedAt || new Date().toISOString()
+      r.notes || '', r.dateAdded || '', r.dateReceived || '', r.soldAt || '', r.updatedAt || '', r.syncedAt || new Date().toISOString()
     ]);
   });
 
@@ -335,6 +338,7 @@ function writeInventory_(ss, rows) {
     var statusCell = sheet.getRange(i, 18);
     var val = statusCell.getValue();
     if (val === 'Sold') statusCell.setBackground('#d4edda').setFontColor('#155724').setFontWeight('bold');
+    if (val === 'In Stock') statusCell.setBackground('#d1fae5').setFontColor('#065f46').setFontWeight('bold');
     if (val === 'Purchased') statusCell.setBackground('#cce5ff').setFontColor('#004085').setFontWeight('bold');
     var profitCell = sheet.getRange(i, 21);
     var p = profitCell.getValue();
@@ -483,6 +487,7 @@ export default function App() {
     return {
       totalUnits: enriched.length,
       purchased: enriched.filter(x => x.status === "Purchased").length,
+      inStock: enriched.filter(x => x.status === "In Stock").length,
       sold: sold.length,
       lotCount: new Set(enriched.map(x => x.lotKey)).size,
       invested,
@@ -550,6 +555,7 @@ export default function App() {
     setUnits(prev => prev.map(u => {
       if (u.unitKey !== unitKey) return u;
       const next = { ...u, ...changes, updatedAt: isoNow() };
+      if (changes.status === "In Stock" && !next.dateReceived) next.dateReceived = isoNow();
       if ((changes.status === "Sold" || (changes.actualSalePrice !== undefined && changes.actualSalePrice !== "")) && !next.soldAt) next.soldAt = isoNow();
       if (changes.status && changes.status !== "Sold" && !next.actualSalePrice) next.soldAt = "";
       return next;
@@ -599,7 +605,7 @@ export default function App() {
         lotProductTotal: String(num(form.productTotal) || ""), lotShippingTotal: String(num(form.shippingTotal) || ""),
         goalSellPrice: d.goalSellPrice || form.goalSellPrice || "",
         status: "Purchased", actualSalePrice: "", notes: d.notes || form.notes || "",
-        dateAdded: purchaseDate, soldAt: "", updatedAt: now
+        dateAdded: purchaseDate, dateReceived: "", soldAt: "", updatedAt: now
       };
     });
     markDirty();
@@ -653,7 +659,8 @@ function Dashboard({ stats, units, dashRange, setDashRange, setFilterStatus, set
   return <>
     <div className="rangeBar"><span>Dashboard range:</span>{["all","week","month","year"].map(r => <button key={r} onClick={() => setDashRange(r)} className={dashRange === r ? "pill active" : "pill"}>{r === "all" ? "All" : r}</button>)}</div>
     <div className="statsGrid">
-      <button className="statCard clickable" onClick={() => clickStatus("Purchased")}><span>Purchased</span><b>{stats.purchased}</b><em>Not sold yet</em></button>
+      <button className="statCard clickable" onClick={() => clickStatus("Purchased")}><span>Purchased</span><b>{stats.purchased}</b><em>Bought / inbound</em></button>
+      <button className="statCard clickable" onClick={() => clickStatus("In Stock")}><span>In Stock</span><b>{stats.inStock}</b><em>Ready to sell</em></button>
       <button className="statCard clickable" onClick={() => clickStatus("Sold")}><span>Sold</span><b className="green">{stats.sold}</b><em>{rangeLabel}: {stats.rangeSold}</em></button>
       <div className="statCard"><span>Total invested</span><b>{money(stats.invested)}</b><em>{stats.totalUnits} units • {stats.lotCount} lots</em></div>
       <div className="statCard"><span>Projected profit</span><b className={stats.projectedProfit >= 0 ? "green" : "red"}>{money(stats.projectedProfit)}</b><em>Open inventory</em></div>
@@ -685,7 +692,7 @@ function Inventory(props: any) {
     </div>
     <div className="countLine">Showing <b>{units.length}</b> items</div>
     <div className="sheetWrap"><table className="inventoryTable"><thead><tr>
-      <th>#</th><th>Edit</th><th>Lot Name</th><th>Unit Name</th><th>Category</th><th>Condition</th><th>Source</th><th>Seller</th><th>Qty in Lot</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal</th><th>Projected Profit</th><th>Status</th><th>Sold For</th><th>Payout</th><th>Actual Profit</th><th>Notes</th><th>Date Purchased</th><th>Date Sold</th>
+      <th>#</th><th>Edit</th><th>Lot Name</th><th>Unit Name</th><th>Category</th><th>Condition</th><th>Source</th><th>Seller</th><th>Qty in Lot</th><th>Product/Unit</th><th>Ship/Unit</th><th>Cost/Unit</th><th>Break Even</th><th>Goal</th><th>Projected Profit</th><th>Status</th><th>Sold For</th><th>Payout</th><th>Actual Profit</th><th>Notes</th><th>Date Purchased</th><th>Date Received</th><th>Date Sold</th>
     </tr></thead><tbody>{units.map((u: FlatCalc, idx: number) => { const projectedPayout = payoutFromSale(u.goalSellPrice); const projectedProfit = projectedPayout === null ? null : projectedPayout - u.totalUnit; return <tr key={u.unitKey}>
       <td className="rowNum">{idx + 1}</td>
       <td><button className="editSmall" onClick={() => { setEditUnitKey(u.unitKey); setView("edit"); }}>Edit</button></td>
@@ -703,6 +710,7 @@ function Inventory(props: any) {
       <td>{money(u.payout)}</td><td className={u.profit === null ? "" : u.profit >= 0 ? "green" : "red"}>{money(u.profit)}</td>
       <td><input value={u.notes} onChange={e => updateUnit(u.unitKey, { notes: e.target.value })} /></td>
       <td><input type="date" value={inputDate(u.dateAdded)} onChange={e => updateUnit(u.unitKey, { dateAdded: isoFromDateInput(e.target.value) })} /></td>
+      <td><input type="date" value={inputDate(u.dateReceived)} onChange={e => updateUnit(u.unitKey, { dateReceived: isoFromDateInput(e.target.value), status: e.target.value && u.status === "Purchased" ? "In Stock" : u.status })} /></td>
       <td><input type="date" value={inputDate(u.soldAt)} onChange={e => updateUnit(u.unitKey, { soldAt: isoFromDateInput(e.target.value), status: e.target.value ? "Sold" : u.status })} /></td>
     </tr>})}</tbody></table></div>
     {!units.length && <div className="empty"><div>📦</div><h3>No inventory found</h3><p>Try clearing filters or adding inventory.</p></div>}
@@ -726,7 +734,8 @@ function EditUnitView({ unit, updateUnit, updateLotShared, deleteUnit, setView }
       <div className="calcBox"><div className="miniGrid"><Mini label="Qty in Lot" value={unit.lotQty} /><Mini label="Product / Unit" value={money(unit.productUnit)} /><Mini label="Shipping / Unit" value={money(unit.shippingUnit)} /><Mini label="Cost / Unit" value={money(unit.totalUnit)} /><Mini label="Break Even" value={money(unit.breakEven)} /><Mini label="Projected Profit" value={money(projectedProfit)} /><Mini label="Projected ROI" value={pct(projectedRoi)} /></div></div>
       <div className="twoCols"><Field label="🎯 Goal Price"><input value={unit.goalSellPrice} inputMode="decimal" onChange={e => updateUnit(unit.unitKey, { goalSellPrice: e.target.value })} /></Field><Field label="📌 Status"><select value={unit.status} onChange={e => updateUnit(unit.unitKey, { status: e.target.value })}>{STATUSES.map(x => <option key={x}>{x}</option>)}</select></Field></div>
       <div className="twoCols"><Field label="💰 Sold For"><input value={unit.actualSalePrice} inputMode="decimal" onChange={e => updateUnit(unit.unitKey, { actualSalePrice: e.target.value })} /></Field><Field label="Actual Profit"><input value={money(unit.profit)} readOnly /></Field></div>
-      <div className="twoCols"><Field label="📅 Date Purchased"><input type="date" value={inputDate(unit.dateAdded)} onChange={e => updateUnit(unit.unitKey, { dateAdded: isoFromDateInput(e.target.value) })} /></Field><Field label="✅ Date Sold"><input type="date" value={inputDate(unit.soldAt)} onChange={e => updateUnit(unit.unitKey, { soldAt: isoFromDateInput(e.target.value), status: e.target.value ? "Sold" : unit.status })} /></Field></div>
+      <div className="twoCols"><Field label="📅 Date Purchased"><input type="date" value={inputDate(unit.dateAdded)} onChange={e => updateUnit(unit.unitKey, { dateAdded: isoFromDateInput(e.target.value) })} /></Field><Field label="📦 Date Received"><input type="date" value={inputDate(unit.dateReceived)} onChange={e => updateUnit(unit.unitKey, { dateReceived: isoFromDateInput(e.target.value), status: e.target.value && unit.status === "Purchased" ? "In Stock" : unit.status })} /></Field></div>
+      <div className="twoCols"><Field label="✅ Date Sold"><input type="date" value={inputDate(unit.soldAt)} onChange={e => updateUnit(unit.unitKey, { soldAt: isoFromDateInput(e.target.value), status: e.target.value ? "Sold" : unit.status })} /></Field><div></div></div>
       <Field label="📝 Notes"><textarea value={unit.notes} onChange={e => updateUnit(unit.unitKey, { notes: e.target.value })} /></Field>
       <div className="buttonRow"><button className="primary" onClick={() => setView("inventory")}>Done</button><button className="secondary danger" onClick={() => { deleteUnit(unit.unitKey); setView("inventory"); }}>Delete this unit</button></div>
     </div>
