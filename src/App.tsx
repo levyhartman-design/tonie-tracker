@@ -11,7 +11,7 @@ const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdR
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
 const STATUSES = ["Purchased", "In Stock", "Sold"];
-const SCHEMA_VERSION = "15.0-status-lotcalc";
+const SCHEMA_VERSION = "16.0-reliability-reporting";
 
 type Unit = {
   unitKey: string;
@@ -38,6 +38,9 @@ type Settings = {
   syncMode: "auto" | "manual";
   lastSynced: number | null;
   firstPullDone: boolean;
+  lastPushCount?: number;
+  lastPullCount?: number;
+  syncLog?: string[];
 };
 
 type DraftUnit = { unitName: string; category: string; condition: string; goalSellPrice: string; notes: string };
@@ -195,12 +198,41 @@ function toSheetRows(units: Unit[]) {
   }));
 }
 
+function summarizeUnits(list: FlatCalc[]) {
+  const sold = list.filter(x => x.status === "Sold");
+  const open = list.filter(x => x.status !== "Sold");
+  const spent = list.reduce((s, x) => s + x.totalUnit, 0);
+  const projectedSales = open.reduce((s, x) => s + num(x.goalSellPrice), 0);
+  const projectedProfit = open.reduce((s, x) => { const p = payoutFromSale(x.goalSellPrice); return s + (p === null ? 0 : p - x.totalUnit); }, 0);
+  const actualSales = sold.reduce((s, x) => s + num(x.actualSalePrice), 0);
+  const actualProfit = sold.reduce((s, x) => s + (x.profit || 0), 0);
+  return { count: list.length, spent, projectedSales, projectedProfit, actualSales, actualProfit, soldCount: sold.length, openCount: open.length };
+}
+
+function groupedReport(units: FlatCalc[], key: keyof Unit, limit = 8) {
+  const buckets: Record<string, FlatCalc[]> = {};
+  units.forEach(u => { const name = String((u as any)[key] || "Blank"); (buckets[name] ||= []).push(u); });
+  return Object.entries(buckets).map(([name, items]) => ({ name, ...summarizeUnits(items) })).sort((a,b) => b.projectedProfit - a.projectedProfit).slice(0, limit);
+}
+
+function backupLocalSnapshots(units: Unit[], label: string) {
+  try {
+    const snapshot = { at: new Date().toISOString(), label, count: units.length, rows: units };
+    const raw = localStorage.getItem("dahlia_local_snapshots_v16") || "[]";
+    const arr = JSON.parse(raw);
+    arr.unshift(snapshot);
+    localStorage.setItem("dahlia_local_snapshots_v16", JSON.stringify(arr.slice(0, 20)));
+  } catch {}
+}
+
 async function pushToSheets(units: Unit[]) {
+  const rows = toSheetRows(units);
+  if (!rows.length) throw new Error("Push blocked: local inventory is empty.");
   await fetch(DEFAULT_SCRIPT_URL, {
     method: "POST",
     mode: "no-cors",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({ action: "syncInventory", schemaVersion: SCHEMA_VERSION, rows: toSheetRows(units) })
+    body: JSON.stringify({ action: "syncInventory", schemaVersion: SCHEMA_VERSION, rows })
   });
 }
 
@@ -254,19 +286,24 @@ function rowsToUnits(rows: any[]): Unit[] {
   });
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '15.0-status-lotcalc';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '16.0-reliability-reporting';
+var REQUIRED_COLS = 27;
 
 function doPost(e) {
   try {
     var data = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     if (data.action === 'syncInventory' || data.action === 'sync') {
-      writeInventory_(ss, data.rows || []);
-      return output_({ status: 'ok', rowsWritten: (data.rows || []).length, schemaVersion: SCHEMA_VERSION });
+      var rows = data.rows || [];
+      if (!rows.length) {
+        return output_({ status: 'blocked', message: 'Push rejected: 0 rows received. Sheet was not changed.', rowsWritten: 0, schemaVersion: SCHEMA_VERSION });
+      }
+      writeInventory_(ss, rows);
+      return output_({ status: 'ok', rowsWritten: rows.length, schemaVersion: SCHEMA_VERSION });
     }
-    return output_({ status: 'ok', message: 'No action' });
+    return output_({ status: 'ok', message: 'No action', schemaVersion: SCHEMA_VERSION });
   } catch (err) {
-    return output_({ status: 'error', message: String(err) });
+    return output_({ status: 'error', message: String(err), schemaVersion: SCHEMA_VERSION });
   }
 }
 
@@ -275,15 +312,16 @@ function doGet(e) {
     var action = e && e.parameter && e.parameter.action || 'readInventory';
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     if (action === 'readInventory' || action === 'read') {
-      return output_({ rows: readSheetRows_(ss, 'Inventory'), schemaVersion: SCHEMA_VERSION }, e);
+      var rows = readSheetRows_(ss, 'Inventory');
+      return output_({ rows: rows, count: rows.length, schemaVersion: SCHEMA_VERSION }, e);
     }
     if (action === 'backupNow') {
       var name = backupInventoryNow();
-      return output_({ status: 'ok', backup: name }, e);
+      return output_({ status: 'ok', backup: name, schemaVersion: SCHEMA_VERSION }, e);
     }
     return output_({ rows: readSheetRows_(ss, 'Inventory'), schemaVersion: SCHEMA_VERSION }, e);
   } catch (err) {
-    return output_({ rows: [], error: String(err) }, e);
+    return output_({ rows: [], error: String(err), schemaVersion: SCHEMA_VERSION }, e);
   }
 }
 
@@ -291,7 +329,7 @@ function readSheetRows_(ss, sheetName) {
   var sheet = ss.getSheetByName(sheetName);
   if (!sheet || sheet.getLastRow() < 2) return [];
   var values = sheet.getDataRange().getValues();
-  var headers = values[0];
+  var headers = values[0].map(function(h) { return String(h).trim(); });
   return values.slice(1).filter(function(r) { return r.join('').trim() !== ''; }).map(function(r) {
     var obj = {};
     headers.forEach(function(h, i) { obj[h] = r[i]; });
@@ -299,11 +337,18 @@ function readSheetRows_(ss, sheetName) {
   });
 }
 
+function ensureColumns_(sheet, neededCols) {
+  var currentCols = sheet.getMaxColumns();
+  if (currentCols < neededCols) {
+    sheet.insertColumnsAfter(currentCols, neededCols - currentCols);
+  }
+  sheet.showColumns(1, neededCols);
+}
+
 function writeInventory_(ss, rows) {
+  if (!rows || !rows.length) throw new Error('Push rejected: empty inventory would erase sheet.');
   var sheet = ss.getSheetByName('Inventory') || ss.insertSheet('Inventory');
-  sheet.clearContents();
-  sheet.clearFormats();
-  sheet.showColumns(1, 27);
+  ensureColumns_(sheet, REQUIRED_COLS);
 
   var headers = [
     'Internal Unit Key','Internal Lot Key','Schema Version',
@@ -312,27 +357,34 @@ function writeInventory_(ss, rows) {
     'Product Cost / Unit','Shipping / Unit','Total Cost / Unit','Break Even',
     'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Purchased','Date Received','Date Sold','Updated At','Synced At'
   ];
-  sheet.appendRow(headers);
 
+  var out = [headers];
   rows.forEach(function(r) {
-    sheet.appendRow([
+    out.push([
       r.unitKey || '', r.lotKey || '', r.schemaVersion || SCHEMA_VERSION,
       r.lotName || '', r.unitName || '', r.category || '', r.condition || '', r.source || '', r.seller || '', Number(r.unitsInLot || 1),
       Number(r.lotProductTotalRaw || 0), Number(r.lotShippingTotalRaw || 0),
       Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.totalCostPerUnit || 0), Number(r.breakEven || 0),
-      r.goalSellPrice ? Number(r.goalSellPrice) : '', r.status || 'Purchased',
-      r.actualSalePrice ? Number(r.actualSalePrice) : '', r.payoutAfterFees ? Number(r.payoutAfterFees) : '', r.profitVsCost ? Number(r.profitVsCost) : '',
+      r.goalSellPrice === '' || r.goalSellPrice == null ? '' : Number(r.goalSellPrice), r.status || 'Purchased',
+      r.actualSalePrice === '' || r.actualSalePrice == null ? '' : Number(r.actualSalePrice), r.payoutAfterFees === '' || r.payoutAfterFees == null ? '' : Number(r.payoutAfterFees), r.profitVsCost === '' || r.profitVsCost == null ? '' : Number(r.profitVsCost),
       r.notes || '', r.dateAdded || '', r.dateReceived || '', r.soldAt || '', r.updatedAt || '', r.syncedAt || new Date().toISOString()
     ]);
   });
 
+  // Only clear after all incoming rows are validated and prepared.
+  sheet.clearContents();
+  sheet.clearFormats();
+  ensureColumns_(sheet, REQUIRED_COLS);
+  sheet.getRange(1, 1, out.length, headers.length).setValues(out);
+  formatInventorySheet_(sheet, headers.length);
+}
+
+function formatInventorySheet_(sheet, lastCol) {
   var lastRow = Math.max(sheet.getLastRow(), 1);
-  var lastCol = headers.length;
   sheet.getRange(1, 1, lastRow, lastCol).setFontFamily('Arial').setFontSize(10).setBorder(true, true, true, true, true, true, '#e0e0e0', SpreadsheetApp.BorderStyle.SOLID);
   sheet.getRange(1, 1, 1, lastCol).setBackground('#4a235a').setFontColor('#ffffff').setFontWeight('bold').setFontSize(11);
-  sheet.hideColumns(1, 3);
-  sheet.hideColumns(11, 2);
-
+  if (lastCol >= 3) sheet.hideColumns(1, 3);
+  if (lastCol >= 12) sheet.hideColumns(11, 2);
   for (var i = 2; i <= lastRow; i++) {
     sheet.getRange(i, 1, 1, lastCol).setBackground(i % 2 === 0 ? '#f8f0ff' : '#ffffff').setFontColor('#222222');
     var statusCell = sheet.getRange(i, 18);
@@ -381,8 +433,8 @@ function output_(obj, e) {
 export default function App() {
   const [units, setUnits] = useState<Unit[]>(loadInitialUnits);
   const [settings, setSettings] = useState<Settings>(() => {
-    try { return { syncMode: "auto", lastSynced: null, firstPullDone: false, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; }
-    catch { return { syncMode: "auto", lastSynced: null, firstPullDone: false }; }
+    try { return { syncMode: "auto", lastSynced: null, firstPullDone: false, lastPushCount: 0, lastPullCount: 0, syncLog: [], ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; }
+    catch { return { syncMode: "auto", lastSynced: null, firstPullDone: false, lastPushCount: 0, lastPullCount: 0, syncLog: [] }; }
   });
   const [view, setView] = useState("dashboard");
   const [editUnitKey, setEditUnitKey] = useState<string | null>(null);
@@ -392,6 +444,8 @@ export default function App() {
   const [filterCondition, setFilterCondition] = useState("All");
   const [filterSource, setFilterSource] = useState("All");
   const [filterSeller, setFilterSeller] = useState("All");
+  const [filterLot, setFilterLot] = useState("All");
+  const [filterDateRange, setFilterDateRange] = useState("All");
   const [sortBy, setSortBy] = useState("date-desc");
   const [dashRange, setDashRange] = useState("all");
   const [search, setSearch] = useState("");
@@ -436,6 +490,7 @@ export default function App() {
   useEffect(() => {
     const emergencyPush = () => {
       if (!dirtyRef.current || !hasPulledRef.current) return;
+      if (!unitsRef.current.length) return;
       try {
         const payload = JSON.stringify({ action: "syncInventory", schemaVersion: SCHEMA_VERSION, rows: toSheetRows(unitsRef.current) });
         fetch(DEFAULT_SCRIPT_URL, { method: "POST", mode: "no-cors", keepalive: true, headers: { "Content-Type": "text/plain;charset=utf-8" }, body: payload });
@@ -451,6 +506,7 @@ export default function App() {
   const categories = useMemo(() => Array.from(new Set(units.map(x => x.category).filter(Boolean))).sort(), [units]);
   const sources = useMemo(() => Array.from(new Set(units.map(x => x.source).filter(Boolean))).sort(), [units]);
   const sellers = useMemo(() => Array.from(new Set(units.map(x => x.seller).filter(Boolean))).sort(), [units]);
+  const lots = useMemo(() => Array.from(new Set(units.map(x => x.lotName).filter(Boolean))).sort(), [units]);
   const conditions = useMemo(() => Array.from(new Set(units.map(x => x.condition).filter(Boolean))).sort(), [units]);
 
   const filtered = useMemo(() => {
@@ -461,6 +517,8 @@ export default function App() {
         (filterCondition === "All" || x.condition === filterCondition) &&
         (filterSource === "All" || x.source === filterSource) &&
         (filterSeller === "All" || x.seller === filterSeller) &&
+        (filterLot === "All" || x.lotName === filterLot) &&
+        (filterDateRange === "All" || dateMs(x.dateAdded) >= Date.now() - (filterDateRange === "7" ? 7 : filterDateRange === "30" ? 30 : 365) * 86400000) &&
         (!q || `${x.unitName} ${x.lotName} ${x.category} ${x.source} ${x.seller} ${x.condition} ${x.status}`.toLowerCase().includes(q));
     });
     return [...list].sort((a,b) => {
@@ -470,7 +528,9 @@ export default function App() {
       if (sortBy === "date-asc") return dateMs(a.dateAdded) - dateMs(b.dateAdded);
       return dateMs(b.dateAdded) - dateMs(a.dateAdded);
     });
-  }, [enriched, filterStatus, filterCategory, filterCondition, filterSource, filterSeller, sortBy, search]);
+  }, [enriched, filterStatus, filterCategory, filterCondition, filterSource, filterSeller, filterLot, filterDateRange, sortBy, search]);
+
+  const filteredStats = useMemo(() => summarizeUnits(filtered), [filtered]);
 
   const stats = useMemo(() => {
     const now = Date.now();
@@ -503,24 +563,41 @@ export default function App() {
   }, [enriched, dashRange]);
 
   function flash(text: string) { setMessage(text); setTimeout(() => setMessage(""), 3500); }
-  function localBackup(label: string) { try { localStorage.setItem(`dahlia_backup_${label}_${Date.now()}`, JSON.stringify(units)); } catch {} }
-  function markDirty() { setDirty(true); }
+  function addSyncLog(line: string) { setSettings(s => ({ ...s, syncLog: [`${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} • ${line}`, ...(s.syncLog || [])].slice(0, 8) })); }
+  function localBackup(label: string) { backupLocalSnapshots(unitsRef.current, label); }
+  function markDirty() { setDirty(true); backupLocalSnapshots(unitsRef.current, "before_edit"); }
 
   async function doPush(silent = false, force = false) {
+    const current = unitsRef.current;
     if (!force && !hasPulledThisSession) {
       setSyncStatus("error");
       if (!silent) flash("Push blocked: first pull from Google Sheets this session.");
+      addSyncLog("Push blocked - no pull this session");
       setTimeout(() => setSyncStatus("idle"), 2600);
       return;
     }
+    if (!current.length) {
+      setSyncStatus("error");
+      if (!silent) flash("Push blocked: local inventory is empty.");
+      addSyncLog("Push blocked - 0 local items");
+      setTimeout(() => setSyncStatus("idle"), 2600);
+      return;
+    }
+    const lastCount = settings.lastPushCount || settings.lastPullCount || 0;
+    if (!silent && lastCount > 0 && current.length < Math.max(1, Math.floor(lastCount * 0.8))) {
+      const ok = confirm(`Safety warning: this push has ${current.length} items, but last sync had ${lastCount}. This could remove many rows from Google Sheets. Continue?`);
+      if (!ok) { addSyncLog("Push cancelled - large decrease"); return; }
+    }
     setSyncStatus("syncing");
     try {
-      await pushToSheets(units);
+      localBackup("before_push");
+      await pushToSheets(current);
       setDirty(false);
-      setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true }));
+      setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true, lastPushCount: current.length }));
+      addSyncLog(`Pushed ${current.length} items`);
       setSyncStatus("success");
-      if (!silent) flash("Pushed safely to Google Sheets");
-    } catch (e: any) { setSyncStatus("error"); if (!silent) flash(e?.message || "Push failed"); }
+      if (!silent) flash(`Pushed ${current.length} items safely to Google Sheets`);
+    } catch (e: any) { setSyncStatus("error"); addSyncLog(`Push failed - ${e?.message || "unknown"}`); if (!silent) flash(e?.message || "Push failed"); }
     setTimeout(() => setSyncStatus("idle"), 2600);
   }
 
@@ -542,11 +619,12 @@ export default function App() {
       sessionStorage.setItem(SESSION_PULL_KEY, "1");
       setHasPulledThisSession(true);
       cloudLoaded.current = true;
-      setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true }));
+      setSettings(s => ({ ...s, lastSynced: Date.now(), firstPullDone: true, lastPullCount: next.length }));
+      addSyncLog(`Pulled ${next.length} items`);
       setLastPullInfo(`Pulled ${next.length} units from Sheets`);
       setSyncStatus("success");
       if (!silent) flash(`Pulled ${next.length} units from Sheets`);
-    } catch (e: any) { setSyncStatus("error"); cloudLoaded.current = true; if (!silent) flash(e?.message || "Pull failed"); }
+    } catch (e: any) { setSyncStatus("error"); cloudLoaded.current = true; addSyncLog(`Pull failed - ${e?.message || "unknown"}`); if (!silent) flash(e?.message || "Pull failed"); }
     setTimeout(() => setSyncStatus("idle"), 3000);
   }
 
@@ -634,12 +712,12 @@ export default function App() {
       {message && <div className="toast">{message}</div>}
     </header>
     <main className="container">
-      {view === "dashboard" && <Dashboard stats={stats} units={enriched} dashRange={dashRange} setDashRange={setDashRange} setFilterStatus={setFilterStatus} setView={setView} />}
-      {view === "inventory" && <Inventory units={filtered} setView={setView} setEditUnitKey={setEditUnitKey} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} search={search} setSearch={setSearch} filterStatus={filterStatus} setFilterStatus={setFilterStatus} filterCategory={filterCategory} setFilterCategory={setFilterCategory} filterCondition={filterCondition} setFilterCondition={setFilterCondition} filterSource={filterSource} setFilterSource={setFilterSource} filterSeller={filterSeller} setFilterSeller={setFilterSeller} categories={categories} conditions={conditions} sources={sources} sellers={sellers} sortBy={sortBy} setSortBy={setSortBy} />}
+      {view === "dashboard" && <Dashboard stats={stats} units={enriched} dashRange={dashRange} setDashRange={setDashRange} setFilterStatus={setFilterStatus} setFilterSeller={setFilterSeller} setFilterLot={setFilterLot} setView={setView} />}
+      {view === "inventory" && <Inventory units={filtered} setView={setView} setEditUnitKey={setEditUnitKey} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} search={search} setSearch={setSearch} filterStatus={filterStatus} setFilterStatus={setFilterStatus} filterCategory={filterCategory} setFilterCategory={setFilterCategory} filterCondition={filterCondition} setFilterCondition={setFilterCondition} filterSource={filterSource} setFilterSource={setFilterSource} filterSeller={filterSeller} setFilterSeller={setFilterSeller} filterLot={filterLot} setFilterLot={setFilterLot} filterDateRange={filterDateRange} setFilterDateRange={setFilterDateRange} categories={categories} conditions={conditions} sources={sources} sellers={sellers} lots={lots} sortBy={sortBy} setSortBy={setSortBy} filteredStats={filteredStats} />}
       {view === "edit" && <EditUnitView unit={enriched.find(u => u.unitKey === editUnitKey)} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} setView={setView} />}
       {view === "add" && <AddFormView form={form} setForm={setForm} setQuantityDraft={setQuantityDraft} saveNew={saveNew} formQty={formQty} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} expectedProfit={expectedProfit} expectedRoi={expectedRoi} />}
       {view === "calculator" && <WhatnotCalculator />}
-      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} hasPulledThisSession={hasPulledThisSession} dirty={dirty} />}
+      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} hasPulledThisSession={hasPulledThisSession} dirty={dirty} units={units} />}
     </main>
     <nav className="nav">
       <button onClick={() => setView("dashboard")} className={view === "dashboard" ? "navBtn active" : "navBtn"}>📊<span>Dashboard</span></button>
@@ -651,44 +729,72 @@ export default function App() {
   </div>;
 }
 
-function Dashboard({ stats, units, dashRange, setDashRange, setFilterStatus, setView }: any) {
+function Dashboard({ stats, units, dashRange, setDashRange, setFilterStatus, setFilterSeller, setFilterLot, setView }: any) {
   const topProfit = [...units].filter((u: FlatCalc) => u.profit !== null).sort((a: FlatCalc,b: FlatCalc) => (b.profit || 0) - (a.profit || 0)).slice(0,5);
-  const groupedLots = Object.values(units.reduce((acc: any, u: FlatCalc) => { (acc[u.lotKey] ||= { lotName: u.lotName, count: 0, value: 0 }).count++; acc[u.lotKey].value += u.totalUnit; return acc; }, {})).slice(0,6) as any[];
+  const lotReport = groupedReport(units, "lotName", 8);
+  const sellerReport = groupedReport(units, "seller", 8);
+  const categoryReport = groupedReport(units, "category", 8);
   const rangeLabel = dashRange === "all" ? "All time" : dashRange === "week" ? "Last 7 days" : dashRange === "month" ? "Last 30 days" : "Last year";
   function clickStatus(s: string) { setFilterStatus(s); setView("inventory"); }
+  function clickSeller(s: string) { setFilterSeller(s === "Blank" ? "" : s); setView("inventory"); }
+  function clickLot(s: string) { setFilterLot(s === "Blank" ? "" : s); setView("inventory"); }
   return <>
     <div className="rangeBar"><span>Dashboard range:</span>{["all","week","month","year"].map(r => <button key={r} onClick={() => setDashRange(r)} className={dashRange === r ? "pill active" : "pill"}>{r === "all" ? "All" : r}</button>)}</div>
     <div className="statsGrid">
       <button className="statCard clickable" onClick={() => clickStatus("Purchased")}><span>Purchased</span><b>{stats.purchased}</b><em>Bought / inbound</em></button>
       <button className="statCard clickable" onClick={() => clickStatus("In Stock")}><span>In Stock</span><b>{stats.inStock}</b><em>Ready to sell</em></button>
       <button className="statCard clickable" onClick={() => clickStatus("Sold")}><span>Sold</span><b className="green">{stats.sold}</b><em>{rangeLabel}: {stats.rangeSold}</em></button>
-      <div className="statCard"><span>Total invested</span><b>{money(stats.invested)}</b><em>{stats.totalUnits} units • {stats.lotCount} lots</em></div>
-      <div className="statCard"><span>Projected profit</span><b className={stats.projectedProfit >= 0 ? "green" : "red"}>{money(stats.projectedProfit)}</b><em>Open inventory</em></div>
-    </div>
-    <div className="statsGrid wide">
-      <div className="statCard"><span>Past sales collected</span><b>{money(stats.actualSales)}</b><em>Payout after fees: {money(stats.actualPayout)}</em></div>
+      <div className="statCard"><span>Total spent</span><b>{money(stats.invested)}</b><em>{stats.totalUnits} units • {stats.lotCount} lots</em></div>
+      <div className="statCard"><span>Projected sales</span><b>{money(stats.projectedSales)}</b><em>Open inventory goal total</em></div>
+      <div className="statCard"><span>Projected profit</span><b className={stats.projectedProfit >= 0 ? "green" : "red"}>{money(stats.projectedProfit)}</b><em>Open inventory after fees</em></div>
+      <div className="statCard"><span>Actual sales collected</span><b>{money(stats.actualSales)}</b><em>Payout after fees: {money(stats.actualPayout)}</em></div>
       <div className="statCard"><span>Actual profit</span><b className={stats.actualProfit >= 0 ? "green" : "red"}>{money(stats.actualProfit)}</b><em>{rangeLabel}</em></div>
-      <div className="statCard"><span>Future projected sales</span><b>{money(stats.projectedSales)}</b><em>Projected profit: {money(stats.projectedProfit)}</em></div>
+    </div>
+    <div className="dashGrid reports">
+      <div className="panel"><h3>🧑‍💼 Profit projection by seller</h3>{sellerReport.map((r:any) => <button className="miniLine reportLine" key={r.name} onClick={() => clickSeller(r.name)}><span>{r.name}<small>{r.count} units • spent {money(r.spent)}</small></span><b className={r.projectedProfit >= 0 ? "green" : "red"}>{money(r.projectedProfit)}</b></button>)}</div>
+      <div className="panel"><h3>📦 Profit projection by lot</h3>{lotReport.map((r:any) => <button className="miniLine reportLine" key={r.name} onClick={() => clickLot(r.name)}><span>{r.name}<small>{r.count} units • spent {money(r.spent)}</small></span><b className={r.projectedProfit >= 0 ? "green" : "red"}>{money(r.projectedProfit)}</b></button>)}</div>
+      <div className="panel"><h3>🗂️ Projection by category</h3>{categoryReport.map((r:any) => <div className="miniLine" key={r.name}><span>{r.name}<small>{r.count} units • sales {money(r.projectedSales)}</small></span><b className={r.projectedProfit >= 0 ? "green" : "red"}>{money(r.projectedProfit)}</b></div>)}</div>
     </div>
     <div className="dashGrid">
-      <div className="panel"><h3>🏆 Best sold profit</h3>{topProfit.length ? topProfit.map((u: FlatCalc) => <div className="miniLine" key={u.unitKey}><span>{u.unitName}<small>{u.lotName}</small></span><b className={u.profit! >= 0 ? "green" : "red"}>{money(u.profit)}</b></div>) : <p className="muted">No sold items yet.</p>}</div>
-      <div className="panel"><h3>📦 Lot summary</h3>{groupedLots.map((l:any) => <div className="miniLine" key={l.lotName}><span>{l.lotName}<small>{l.count} units</small></span><b>{money(l.value)}</b></div>)}</div>
+      <div className="panel"><h3>🏆 Best sold profit</h3>{topProfit.length ? topProfit.map((u: FlatCalc) => <div className="miniLine" key={u.unitKey}><span>{u.unitName}<small>{u.lotName} • {u.seller || "No seller"}</small></span><b className={u.profit! >= 0 ? "green" : "red"}>{money(u.profit)}</b></div>) : <p className="muted">No sold items yet.</p>}</div>
       <div className="panel"><h3>📌 Averages</h3><Mini label="Average cost" value={money(stats.avgCost)} /><Mini label="Average goal" value={money(stats.avgGoal)} /></div>
     </div>
   </>;
 }
 
 function Inventory(props: any) {
-  const { units, setView, setEditUnitKey, updateUnit, updateLotShared, deleteUnit, search, setSearch, filterStatus, setFilterStatus, filterCategory, setFilterCategory, filterCondition, setFilterCondition, filterSource, setFilterSource, filterSeller, setFilterSeller, categories, conditions, sources, sellers, sortBy, setSortBy } = props;
+  const { units, setView, setEditUnitKey, updateUnit, updateLotShared, search, setSearch, filterStatus, setFilterStatus, filterCategory, setFilterCategory, filterCondition, setFilterCondition, filterSource, setFilterSource, filterSeller, setFilterSeller, filterLot, setFilterLot, filterDateRange, setFilterDateRange, categories, conditions, sources, sellers, lots, sortBy, setSortBy, filteredStats } = props;
+  const activeFilters = [
+    filterStatus !== "All" && `Status: ${filterStatus}`,
+    filterSeller !== "All" && `Seller: ${filterSeller || "Blank"}`,
+    filterLot !== "All" && `Lot: ${filterLot || "Blank"}`,
+    filterCategory !== "All" && `Category: ${filterCategory || "Blank"}`,
+    filterSource !== "All" && `Source: ${filterSource || "Blank"}`,
+    filterCondition !== "All" && `Condition: ${filterCondition}`,
+    filterDateRange !== "All" && `Date: last ${filterDateRange} days`,
+    search && `Search: ${search}`
+  ].filter(Boolean);
+  const clearFilters = () => { setFilterStatus("All"); setFilterSeller("All"); setFilterLot("All"); setFilterCategory("All"); setFilterSource("All"); setFilterCondition("All"); setFilterDateRange("All"); setSearch(""); };
   return <>
-    <div className="toolbar advanced">
-      <input className="search" placeholder="Search unit, lot, seller, source..." value={search} onChange={e => setSearch(e.target.value)} />
-      <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}><option>All</option>{STATUSES.map(x => <option key={x}>{x}</option>)}</select>
-      <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)}><option>All</option>{categories.map((x:string) => <option key={x}>{x}</option>)}</select>
-      <select value={filterCondition} onChange={e => setFilterCondition(e.target.value)}><option>All</option>{conditions.map((x:string) => <option key={x}>{x}</option>)}</select>
-      <select value={filterSource} onChange={e => setFilterSource(e.target.value)}><option>All</option>{sources.map((x:string) => <option key={x}>{x}</option>)}</select>
-      <select value={filterSeller} onChange={e => setFilterSeller(e.target.value)}><option>All</option>{sellers.map((x:string) => <option key={x}>{x}</option>)}</select>
-      <select value={sortBy} onChange={e => setSortBy(e.target.value)}><option value="date-desc">Newest first</option><option value="date-asc">Oldest first</option><option value="name">Name</option><option value="category">Category</option><option value="seller">Seller</option></select>
+    <div className="statsGrid inventoryTotals">
+      <div className="statCard"><span>Spent in current view</span><b>{money(filteredStats.spent)}</b><em>{filteredStats.count} units showing</em></div>
+      <div className="statCard"><span>Projected sales</span><b>{money(filteredStats.projectedSales)}</b><em>Goal total for unsold shown</em></div>
+      <div className="statCard"><span>Projected profit</span><b className={filteredStats.projectedProfit >= 0 ? "green" : "red"}>{money(filteredStats.projectedProfit)}</b><em>Unsold shown after fees</em></div>
+      <div className="statCard"><span>Actual profit</span><b className={filteredStats.actualProfit >= 0 ? "green" : "red"}>{money(filteredStats.actualProfit)}</b><em>{filteredStats.soldCount} sold items shown</em></div>
+    </div>
+    <div className="filterPanel">
+      <div className="toolbar advanced v16filters">
+        <input className="search" placeholder="Search unit, lot, seller, source..." value={search} onChange={e => setSearch(e.target.value)} />
+        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}><option>All</option>{STATUSES.map(x => <option key={x}>{x}</option>)}</select>
+        <select value={filterSeller} onChange={e => setFilterSeller(e.target.value)}><option>All</option>{sellers.map((x:string) => <option key={x}>{x}</option>)}</select>
+        <select value={filterLot} onChange={e => setFilterLot(e.target.value)}><option>All</option>{lots.map((x:string) => <option key={x}>{x}</option>)}</select>
+        <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)}><option>All</option>{categories.map((x:string) => <option key={x}>{x}</option>)}</select>
+        <select value={filterSource} onChange={e => setFilterSource(e.target.value)}><option>All</option>{sources.map((x:string) => <option key={x}>{x}</option>)}</select>
+        <select value={filterCondition} onChange={e => setFilterCondition(e.target.value)}><option>All</option>{conditions.map((x:string) => <option key={x}>{x}</option>)}</select>
+        <select value={filterDateRange} onChange={e => setFilterDateRange(e.target.value)}><option value="All">Any purchase date</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="365">Last year</option></select>
+        <select value={sortBy} onChange={e => setSortBy(e.target.value)}><option value="date-desc">Newest first</option><option value="date-asc">Oldest first</option><option value="name">Name</option><option value="category">Category</option><option value="seller">Seller</option></select>
+      </div>
+      <div className="activeFilters">{activeFilters.length ? <><b>Filtered by:</b> {activeFilters.map((x:any) => <span className="filterChip" key={x}>{x}</span>)}<button className="smallBtn" onClick={clearFilters}>Clear</button></> : <span>No filters active</span>}</div>
     </div>
     <div className="countLine">Showing <b>{units.length}</b> items</div>
     <div className="sheetWrap"><table className="inventoryTable"><thead><tr>
@@ -716,7 +822,6 @@ function Inventory(props: any) {
     {!units.length && <div className="empty"><div>📦</div><h3>No inventory found</h3><p>Try clearing filters or adding inventory.</p></div>}
   </>;
 }
-
 
 function EditUnitView({ unit, updateUnit, updateLotShared, deleteUnit, setView }: any) {
   if (!unit) return <div className="formWrap"><div className="panel"><h2>Item not found</h2><button className="primary" onClick={() => setView("inventory")}>Back to Inventory</button></div></div>;
@@ -764,16 +869,29 @@ function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formPr
   </div>;
 }
 
-function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastPullInfo, setUnits, hasPulledThisSession, dirty }: any) {
+function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastPullInfo, setUnits, hasPulledThisSession, dirty, units }: any) {
+  const snapshotCount = (() => { try { return JSON.parse(localStorage.getItem("dahlia_local_snapshots_v16") || "[]").length; } catch { return 0; } })();
   return <div className="formWrap">
     <h2>⚙️ Settings & Safe Sync</h2>
-    <div className="panel"><h3>Google Sheets Sync</h3><p className="muted">Sync buttons live only here to prevent accidental pulls. Push is blocked until this browser session has successfully pulled from Google Sheets.</p>
-      <Field label="Sync Mode"><select value={settings.syncMode} onChange={e => setSettings((s: Settings) => ({ ...s, syncMode: e.target.value as Settings["syncMode"] }))}><option value="auto">Auto: pull once per session, then batch-push after edits</option><option value="manual">Manual only</option></select></Field>
-      <div className="syncStateBox"><b>{hasPulledThisSession ? "✅ Sheet loaded this session" : "⚠️ Pull required before any push"}</b><span>{dirty ? "Unsaved changes waiting to sync." : "No unsaved local changes."}</span></div><div className="buttonRow">{hasPulledThisSession ? <button className="primary" onClick={() => doPush(false)}>Save / Push to Sheet Now</button> : <button className="primary" disabled title="Pull first to unlock pushing">Save / Push locked until Pull</button>}<button className="secondary danger" onClick={() => safePullFromSheets(false, false)}>Pull from Sheets - requires confirmation</button></div>
-      <p className="muted">Last synced: {dateText(settings.lastSynced)} {lastPullInfo ? `• ${lastPullInfo}` : ""}</p><p className="muted">Auto-push rule: after a successful pull, edits save locally right away and push to Sheets after about 12 seconds of no activity. Closing/switching apps also attempts an emergency push, but the manual Save button is the safest confirmation.</p>
+    <div className="panel"><h3>🟢 Sync Health</h3>
+      <div className="syncHealthGrid">
+        <Mini label="Local items" value={units.length} />
+        <Mini label="Last push count" value={settings.lastPushCount || "—"} />
+        <Mini label="Last pull count" value={settings.lastPullCount || "—"} />
+        <Mini label="Local snapshots" value={snapshotCount} />
+      </div>
+      <p className="muted">Status: {hasPulledThisSession ? "Sheet loaded this session. Push is unlocked." : "Pull required before normal push. This protects against accidentally overwriting the Sheet."}</p>
+      <p className="muted">Last synced: {dateText(settings.lastSynced)} {lastPullInfo ? `• ${lastPullInfo}` : ""}</p>
+      {(settings.syncLog || []).length ? <div className="syncLog"><b>Recent sync log</b>{(settings.syncLog || []).map((x: string, i: number) => <span key={i}>{x}</span>)}</div> : null}
     </div>
-    <div className="panel"><h3>New Google Apps Script</h3><p className="muted">Replace the old Apps Script with this exact code and deploy a new version.</p><textarea className="codeBox" readOnly value={APPS_SCRIPT_CODE} onFocus={(e) => e.currentTarget.select()} /><Field label="Apps Script URL"><input value={DEFAULT_SCRIPT_URL} readOnly /></Field></div>
-    <div className="panel"><h3>Backup reminder</h3><p className="muted">The script includes backupInventoryNow() and createTwiceDailyBackupTrigger(). Run createTwiceDailyBackupTrigger once inside Google Apps Script to create automatic backups every 12 hours.</p></div>
+    <div className="panel"><h3>Google Sheets Sync</h3><p className="muted">Sync buttons live only here to prevent accidental pulls. v16 blocks empty pushes and warns before large item-count drops.</p>
+      <Field label="Sync Mode"><select value={settings.syncMode} onChange={e => setSettings((s: Settings) => ({ ...s, syncMode: e.target.value as Settings["syncMode"] }))}><option value="auto">Auto: pull once per session, then batch-push after edits</option><option value="manual">Manual only</option></select></Field>
+      <div className="syncStateBox"><b>{hasPulledThisSession ? "✅ Sheet loaded this session" : "⚠️ Pull required before any normal push"}</b><span>{dirty ? "Unsaved changes waiting to sync." : "No unsaved local changes."}</span></div>
+      <div className="buttonRow">{hasPulledThisSession ? <button className="primary" onClick={() => doPush(false)}>Save / Push to Sheet Now</button> : <button className="primary" disabled title="Pull first to unlock pushing">Save / Push locked until Pull</button>}<button className="secondary danger" onClick={() => safePullFromSheets(false, false)}>Pull from Sheets - requires confirmation</button></div>
+      <p className="muted">Auto-push rule: after a successful pull, edits save locally right away and push to Sheets after about 12 seconds of no activity. Closing/switching apps also attempts an emergency push, but the manual Save button is the safest confirmation.</p>
+    </div>
+    <div className="panel"><h3>New Google Apps Script</h3><p className="muted">Replace the old Apps Script with this exact v16 code and deploy a new version. This version rejects 0-row pushes and validates before clearing the sheet.</p><textarea className="codeBox" readOnly value={APPS_SCRIPT_CODE} onFocus={(e) => e.currentTarget.select()} /><Field label="Apps Script URL"><input value={DEFAULT_SCRIPT_URL} readOnly /></Field></div>
+    <div className="panel"><h3>Backup reminder</h3><p className="muted">The script includes backupInventoryNow() and createTwiceDailyBackupTrigger(). Run createTwiceDailyBackupTrigger once inside Google Apps Script to create automatic backups every 12 hours. Local browser snapshots are automatic and keep the last 20 versions.</p></div>
     <div className="panel dangerPanel"><h3>Danger Zone</h3><button className="secondary danger" onClick={() => { if (confirm("Clear local browser data only? This does not delete Google Sheets.")) setUnits([]); }}>Clear local browser data</button></div>
   </div>;
 }
