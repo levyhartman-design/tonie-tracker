@@ -11,7 +11,7 @@ const DEFAULT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbziJgxAQhzdR
 
 const CONDITIONS = ["New", "Like New", "Used Good", "Used Fair"];
 const STATUSES = ["Purchased", "In Stock", "Sold"];
-const SCHEMA_VERSION = "16.0-reliability-reporting";
+const SCHEMA_VERSION = "16.1-reliability-reporting-id-repair";
 
 type Unit = {
   unitKey: string;
@@ -258,35 +258,47 @@ function fetchJsonp(url: string, action = "readInventory", timeoutMs = 15000): P
 }
 
 function rowsToUnits(rows: any[]): Unit[] {
-  const seen: Record<string, boolean> = {};
-  const units = (rows || []).map((r, idx) => normalizeUnit({
-    unitKey: r["Internal Unit Key"] || r.unitKey || r["Unit Key"],
-    lotKey: r["Internal Lot Key"] || r.lotKey || r["Lot Key"],
-    lotName: r["Lot Name"] || r.lotName,
-    unitName: r["Unit Name"] || r.unitName,
-    category: r["Category"] || r.category,
-    condition: r["Condition"] || r.condition,
-    source: r["Source"] || r.source,
-    seller: r["Seller"] || r.seller,
-    lotProductTotal: r["Lot Product Total Raw"] || r.lotProductTotalRaw || r["Lot Product Total"] || r.lotProductTotal,
-    lotShippingTotal: r["Lot Shipping Total Raw"] || r.lotShippingTotalRaw || r["Lot Shipping Total"] || r.lotShippingTotal,
-    goalSellPrice: r["Goal Price"] || r.goalSellPrice,
-    status: r["Status"] || r.status,
-    actualSalePrice: r["Sold For"] || r.actualSalePrice,
-    notes: r["Notes"] || r.notes,
-    dateAdded: r["Date Purchased"] || r["Date Added"] || r.dateAdded,
-    soldAt: r["Date Sold"] || r["Sold At"] || r.soldAt,
-    updatedAt: r["Updated At"] || r.updatedAt,
-    _idx: idx
-  }));
-  return units.filter(u => {
-    if (seen[u.unitKey]) return false;
-    seen[u.unitKey] = true;
-    return true;
+  const seen: Record<string, number> = {};
+  const repaired: Unit[] = [];
+
+  (rows || []).forEach((r, idx) => {
+    const originalKey = String(r["Internal Unit Key"] || r.unitKey || r["Unit Key"] || "").trim();
+    let unitKey = originalKey;
+
+    // Never silently drop rows. If a sheet row has a blank or duplicate key,
+    // repair it locally so every visible row becomes one inventory item.
+    if (!unitKey || seen[unitKey]) {
+      unitKey = `unit_repaired_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+    seen[unitKey] = 1;
+
+    repaired.push(normalizeUnit({
+      unitKey,
+      lotKey: r["Internal Lot Key"] || r.lotKey || r["Lot Key"],
+      lotName: r["Lot Name"] || r.lotName,
+      unitName: r["Unit Name"] || r.unitName,
+      category: r["Category"] || r.category,
+      condition: r["Condition"] || r.condition,
+      source: r["Source"] || r.source,
+      seller: r["Seller"] || r.seller,
+      lotProductTotal: r["Lot Product Total Raw"] || r.lotProductTotalRaw || r["Lot Product Total"] || r.lotProductTotal,
+      lotShippingTotal: r["Lot Shipping Total Raw"] || r.lotShippingTotalRaw || r["Lot Shipping Total"] || r.lotShippingTotal,
+      goalSellPrice: r["Goal Price"] || r.goalSellPrice,
+      status: r["Status"] || r.status,
+      actualSalePrice: r["Sold For"] || r.actualSalePrice,
+      notes: r["Notes"] || r.notes,
+      dateAdded: r["Date Purchased"] || r["Date Added"] || r.dateAdded,
+      dateReceived: r["Date Received"] || r.dateReceived,
+      soldAt: r["Date Sold"] || r["Sold At"] || r.soldAt,
+      updatedAt: r["Updated At"] || r.updatedAt,
+      _idx: idx
+    }));
   });
+
+  return repaired;
 }
 
-const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '16.0-reliability-reporting';
+const APPS_SCRIPT_CODE = `var SCHEMA_VERSION = '16.1-reliability-reporting-id-repair';
 var REQUIRED_COLS = 27;
 
 function doPost(e) {
@@ -298,8 +310,15 @@ function doPost(e) {
       if (!rows.length) {
         return output_({ status: 'blocked', message: 'Push rejected: 0 rows received. Sheet was not changed.', rowsWritten: 0, schemaVersion: SCHEMA_VERSION });
       }
+      var validation = validateRows_(rows);
+      if (!validation.ok) {
+        return output_({ status: 'blocked', message: validation.message, rowsWritten: 0, schemaVersion: SCHEMA_VERSION });
+      }
       writeInventory_(ss, rows);
-      return output_({ status: 'ok', rowsWritten: rows.length, schemaVersion: SCHEMA_VERSION });
+      setMeta_(ss, 'lastRevision', String(Date.now()));
+      setMeta_(ss, 'lastRowCount', String(rows.length));
+      setMeta_(ss, 'lastPushAt', new Date().toISOString());
+      return output_({ status: 'ok', rowsWritten: rows.length, revision: getMeta_(ss, 'lastRevision'), schemaVersion: SCHEMA_VERSION });
     }
     return output_({ status: 'ok', message: 'No action', schemaVersion: SCHEMA_VERSION });
   } catch (err) {
@@ -313,7 +332,18 @@ function doGet(e) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     if (action === 'readInventory' || action === 'read') {
       var rows = readSheetRows_(ss, 'Inventory');
-      return output_({ rows: rows, count: rows.length, schemaVersion: SCHEMA_VERSION }, e);
+      var health = analyzeRows_(rows);
+      return output_({ rows: rows, count: rows.length, health: health, revision: getMeta_(ss, 'lastRevision'), schemaVersion: SCHEMA_VERSION }, e);
+    }
+    if (action === 'repairDuplicateUnitKeys') {
+      var result = repairDuplicateUnitKeys();
+      setMeta_(ss, 'lastRevision', String(Date.now()));
+      setMeta_(ss, 'lastRepairAt', new Date().toISOString());
+      return output_({ status: 'ok', repair: result, revision: getMeta_(ss, 'lastRevision'), schemaVersion: SCHEMA_VERSION }, e);
+    }
+    if (action === 'health') {
+      var healthRows = readSheetRows_(ss, 'Inventory');
+      return output_({ status: 'ok', count: healthRows.length, health: analyzeRows_(healthRows), revision: getMeta_(ss, 'lastRevision'), schemaVersion: SCHEMA_VERSION }, e);
     }
     if (action === 'backupNow') {
       var name = backupInventoryNow();
@@ -323,6 +353,13 @@ function doGet(e) {
   } catch (err) {
     return output_({ rows: [], error: String(err), schemaVersion: SCHEMA_VERSION }, e);
   }
+}
+
+function validateRows_(rows) {
+  if (!rows || !rows.length) return { ok: false, message: 'Push rejected: empty inventory would erase sheet.' };
+  var realRows = rows.filter(function(r) { return String((r.unitName || r['Unit Name'] || '')).trim() !== ''; });
+  if (!realRows.length) return { ok: false, message: 'Push rejected: no rows have Unit Name.' };
+  return { ok: true };
 }
 
 function readSheetRows_(ss, sheetName) {
@@ -337,11 +374,47 @@ function readSheetRows_(ss, sheetName) {
   });
 }
 
+function analyzeRows_(rows) {
+  var seen = {};
+  var duplicateKeys = [];
+  var missingKeys = 0;
+  rows.forEach(function(r) {
+    var key = String(r['Internal Unit Key'] || '').trim();
+    if (!key) { missingKeys++; return; }
+    if (seen[key]) duplicateKeys.push(key);
+    seen[key] = true;
+  });
+  return { totalRows: rows.length, uniqueKeys: Object.keys(seen).length, missingKeys: missingKeys, duplicateCount: duplicateKeys.length, duplicateKeys: duplicateKeys.slice(0, 25) };
+}
+
+function repairDuplicateUnitKeys() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('Inventory');
+  if (!sheet) throw new Error('Inventory sheet not found');
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { scanned: 0, fixed: 0 };
+
+  ensureColumns_(sheet, REQUIRED_COLS);
+  var unitKeyCol = 1;
+  var values = sheet.getRange(2, unitKeyCol, lastRow - 1, 1).getValues();
+  var seen = {};
+  var fixed = 0;
+  for (var i = 0; i < values.length; i++) {
+    var rowNumber = i + 2;
+    var key = String(values[i][0] || '').trim();
+    if (!key || seen[key]) {
+      sheet.getRange(rowNumber, unitKeyCol).setValue('unit_repair_' + Date.now() + '_' + rowNumber + '_' + Math.random().toString(36).slice(2, 8));
+      fixed++;
+    } else {
+      seen[key] = true;
+    }
+  }
+  return { scanned: values.length, fixed: fixed, uniqueAfter: Object.keys(seen).length + fixed };
+}
+
 function ensureColumns_(sheet, neededCols) {
   var currentCols = sheet.getMaxColumns();
-  if (currentCols < neededCols) {
-    sheet.insertColumnsAfter(currentCols, neededCols - currentCols);
-  }
+  if (currentCols < neededCols) sheet.insertColumnsAfter(currentCols, neededCols - currentCols);
   sheet.showColumns(1, neededCols);
 }
 
@@ -358,12 +431,12 @@ function writeInventory_(ss, rows) {
     'Goal Price','Status','Sold For','Payout','Profit','Notes','Date Purchased','Date Received','Date Sold','Updated At','Synced At'
   ];
 
-  var out = [headers];
+  var output = [headers];
   rows.forEach(function(r) {
-    out.push([
+    output.push([
       r.unitKey || '', r.lotKey || '', r.schemaVersion || SCHEMA_VERSION,
       r.lotName || '', r.unitName || '', r.category || '', r.condition || '', r.source || '', r.seller || '', Number(r.unitsInLot || 1),
-      Number(r.lotProductTotalRaw || 0), Number(r.lotShippingTotalRaw || 0),
+      Number(r.lotProductTotalRaw || r.lotProductTotal || 0), Number(r.lotShippingTotalRaw || r.lotShippingTotal || 0),
       Number(r.productCostPerUnit || 0), Number(r.shippingPerUnit || 0), Number(r.totalCostPerUnit || 0), Number(r.breakEven || 0),
       r.goalSellPrice === '' || r.goalSellPrice == null ? '' : Number(r.goalSellPrice), r.status || 'Purchased',
       r.actualSalePrice === '' || r.actualSalePrice == null ? '' : Number(r.actualSalePrice), r.payoutAfterFees === '' || r.payoutAfterFees == null ? '' : Number(r.payoutAfterFees), r.profitVsCost === '' || r.profitVsCost == null ? '' : Number(r.profitVsCost),
@@ -371,20 +444,23 @@ function writeInventory_(ss, rows) {
     ]);
   });
 
-  // Only clear after all incoming rows are validated and prepared.
+  // Validate fully before clearing the existing sheet.
+  if (output.length < 2) throw new Error('Push rejected before clearing: no rows to write.');
+
   sheet.clearContents();
   sheet.clearFormats();
-  ensureColumns_(sheet, REQUIRED_COLS);
-  sheet.getRange(1, 1, out.length, headers.length).setValues(out);
+  sheet.getRange(1, 1, output.length, headers.length).setValues(output);
   formatInventorySheet_(sheet, headers.length);
 }
 
 function formatInventorySheet_(sheet, lastCol) {
   var lastRow = Math.max(sheet.getLastRow(), 1);
+  ensureColumns_(sheet, lastCol);
   sheet.getRange(1, 1, lastRow, lastCol).setFontFamily('Arial').setFontSize(10).setBorder(true, true, true, true, true, true, '#e0e0e0', SpreadsheetApp.BorderStyle.SOLID);
   sheet.getRange(1, 1, 1, lastCol).setBackground('#4a235a').setFontColor('#ffffff').setFontWeight('bold').setFontSize(11);
-  if (lastCol >= 3) sheet.hideColumns(1, 3);
-  if (lastCol >= 12) sheet.hideColumns(11, 2);
+  sheet.hideColumns(1, 3);
+  sheet.hideColumns(11, 2);
+
   for (var i = 2; i <= lastRow; i++) {
     sheet.getRange(i, 1, 1, lastCol).setBackground(i % 2 === 0 ? '#f8f0ff' : '#ffffff').setFontColor('#222222');
     var statusCell = sheet.getRange(i, 18);
@@ -401,6 +477,30 @@ function formatInventorySheet_(sheet, lastCol) {
   });
   for (var c = 1; c <= lastCol; c++) sheet.autoResizeColumn(c);
   sheet.setFrozenRows(1);
+}
+
+function getMetaSheet_(ss) {
+  var sheet = ss.getSheetByName('_Meta') || ss.insertSheet('_Meta');
+  if (sheet.getLastRow() === 0) sheet.appendRow(['Key', 'Value']);
+  try { sheet.hideSheet(); } catch (e) {}
+  return sheet;
+}
+function getMeta_(ss, key) {
+  var sheet = getMetaSheet_(ss);
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) if (String(values[i][0]) === key) return values[i][1];
+  return '';
+}
+function setMeta_(ss, key, value) {
+  var sheet = getMetaSheet_(ss);
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === key) {
+      sheet.getRange(i + 1, 2).setValue(value);
+      return;
+    }
+  }
+  sheet.appendRow([key, value]);
 }
 
 function backupInventoryNow() {
@@ -601,6 +701,25 @@ export default function App() {
     setTimeout(() => setSyncStatus("idle"), 2600);
   }
 
+  async function repairSheetIds() {
+    const ok = confirm("This will repair duplicate/missing Internal Unit Keys in Google Sheets, then pull the repaired data into this device. Make sure nobody is editing right now. Continue?");
+    if (!ok) return;
+    setSyncStatus("syncing");
+    try {
+      const data = await fetchJsonp(DEFAULT_SCRIPT_URL, "repairDuplicateUnitKeys", 30000);
+      if (!data || data.error) throw new Error(data?.error || "Repair failed");
+      const fixed = data?.repair?.fixed ?? 0;
+      addSyncLog(`Repaired ${fixed} duplicate IDs`);
+      flash(`Repair complete: ${fixed} duplicate/missing IDs fixed. Pulling repaired data...`);
+      await safePullFromSheets(true, true);
+    } catch (e: any) {
+      setSyncStatus("error");
+      addSyncLog(`Repair failed - ${e?.message || "unknown"}`);
+      flash(e?.message || "Repair failed");
+      setTimeout(() => setSyncStatus("idle"), 3000);
+    }
+  }
+
   async function safePullFromSheets(silent = false, force = false) {
     if (!force && !silent) {
       const ok = confirm("Pull will replace this browser's current app data with Google Sheets. A local backup will be saved first. Continue?");
@@ -717,7 +836,7 @@ export default function App() {
       {view === "edit" && <EditUnitView unit={enriched.find(u => u.unitKey === editUnitKey)} updateUnit={updateUnit} updateLotShared={updateLotShared} deleteUnit={deleteUnit} setView={setView} />}
       {view === "add" && <AddFormView form={form} setForm={setForm} setQuantityDraft={setQuantityDraft} saveNew={saveNew} formQty={formQty} formProductUnit={formProductUnit} formShipUnit={formShipUnit} formUnitCost={formUnitCost} formBreakEven={formBreakEven} expectedProfit={expectedProfit} expectedRoi={expectedRoi} />}
       {view === "calculator" && <WhatnotCalculator />}
-      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} lastPullInfo={lastPullInfo} setUnits={setUnits} hasPulledThisSession={hasPulledThisSession} dirty={dirty} units={units} />}
+      {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} doPush={doPush} safePullFromSheets={safePullFromSheets} repairSheetIds={repairSheetIds} lastPullInfo={lastPullInfo} setUnits={setUnits} hasPulledThisSession={hasPulledThisSession} dirty={dirty} units={units} />}
     </main>
     <nav className="nav">
       <button onClick={() => setView("dashboard")} className={view === "dashboard" ? "navBtn active" : "navBtn"}>📊<span>Dashboard</span></button>
@@ -869,7 +988,7 @@ function AddFormView({ form, setForm, setQuantityDraft, saveNew, formQty, formPr
   </div>;
 }
 
-function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastPullInfo, setUnits, hasPulledThisSession, dirty, units }: any) {
+function SettingsView({ settings, setSettings, doPush, safePullFromSheets, repairSheetIds, lastPullInfo, setUnits, hasPulledThisSession, dirty, units }: any) {
   const snapshotCount = (() => { try { return JSON.parse(localStorage.getItem("dahlia_local_snapshots_v16") || "[]").length; } catch { return 0; } })();
   return <div className="formWrap">
     <h2>⚙️ Settings & Safe Sync</h2>
@@ -890,6 +1009,7 @@ function SettingsView({ settings, setSettings, doPush, safePullFromSheets, lastP
       <div className="buttonRow">{hasPulledThisSession ? <button className="primary" onClick={() => doPush(false)}>Save / Push to Sheet Now</button> : <button className="primary" disabled title="Pull first to unlock pushing">Save / Push locked until Pull</button>}<button className="secondary danger" onClick={() => safePullFromSheets(false, false)}>Pull from Sheets - requires confirmation</button></div>
       <p className="muted">Auto-push rule: after a successful pull, edits save locally right away and push to Sheets after about 12 seconds of no activity. Closing/switching apps also attempts an emergency push, but the manual Save button is the safest confirmation.</p>
     </div>
+    <div className="panel"><h3>Maintenance</h3><p className="muted">Use this when Sheet rows exist but the app loads fewer items. It repairs duplicate/missing Internal Unit Keys in Google Sheets, then pulls the repaired inventory.</p><div className="buttonRow"><button className="secondary" onClick={repairSheetIds}>Repair Duplicate IDs in Sheet</button></div></div>
     <div className="panel"><h3>New Google Apps Script</h3><p className="muted">Replace the old Apps Script with this exact v16 code and deploy a new version. This version rejects 0-row pushes and validates before clearing the sheet.</p><textarea className="codeBox" readOnly value={APPS_SCRIPT_CODE} onFocus={(e) => e.currentTarget.select()} /><Field label="Apps Script URL"><input value={DEFAULT_SCRIPT_URL} readOnly /></Field></div>
     <div className="panel"><h3>Backup reminder</h3><p className="muted">The script includes backupInventoryNow() and createTwiceDailyBackupTrigger(). Run createTwiceDailyBackupTrigger once inside Google Apps Script to create automatic backups every 12 hours. Local browser snapshots are automatic and keep the last 20 versions.</p></div>
     <div className="panel dangerPanel"><h3>Danger Zone</h3><button className="secondary danger" onClick={() => { if (confirm("Clear local browser data only? This does not delete Google Sheets.")) setUnits([]); }}>Clear local browser data</button></div>
